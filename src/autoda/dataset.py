@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 import pandas as pd
 
@@ -8,6 +8,11 @@ class DatasetContext:
     dataset_id: str
     df: pd.DataFrame
     target: str | None = None
+    current_df: pd.DataFrame = field(init=False)
+    working_df: pd.DataFrame | None = field(default=None, init=False)
+
+    def __post_init__(self):
+        self.current_df = self.df.copy()
 
 
 def profile_dataframe(df: pd.DataFrame, max_categories: int = 20) -> dict[str, Any]:
@@ -23,7 +28,7 @@ def profile_dataframe(df: pd.DataFrame, max_categories: int = 20) -> dict[str, A
             "dtype": str(s.dtype),
             "missing": int(s.isna().sum()),
             "missing_rate": float(s.isna().mean()),
-            "n_unique": int(s.nunique(dropna=True)), # мб ещё unique_rate ?
+            "n_unique": int(s.nunique(dropna=True)),
         }
 
         if s.nunique(dropna=True) <= max_categories:

@@ -6,16 +6,15 @@ df = pd.read_csv(url)
 
 agent = PDAgent(
     provider="timeweb",
-    model="timeweb-agent",  # может игнорироваться Timeweb, но нужен клиенту
-    max_iterations=6,
-    temperature=0,
-    max_tokens=1000,
+    max_iterations=12,
+    patience=4,
 )
 
 result = agent.run(
     df=df,
-    goal="Проведи первичный анализ датасета",
+    goal="Improve CV for survival prediction",
     target="Survived",
 )
 
+print(f"baseline {result.baseline_cv:.4f} -> final {result.final_cv:.4f}")
 print(result.report)
