@@ -57,7 +57,8 @@ reports/
 *.parquet
 *.feather
 
-/docs
+docs/
 CLAUDE.md
-.claude
+.claude/
 test.ipynb
+test_data/
