@@ -1,6 +1,28 @@
 import json
 from typing import Any
 
+DESCRIPTION_TOKEN_BUDGET = 1200  # characters
+
+SUMMARIZE_DESCRIPTION_PROMPT = """\
+You are summarizing a user's free-text description of a tabular dataset.
+
+Goal: produce a compact summary (max ~250 words) that preserves
+- the business meaning of the dataset and the target,
+- any domain-specific column semantics the user mentioned,
+- any data-quality caveats or known issues,
+- competition / scoring conventions if mentioned.
+
+Drop fluff, examples that don't illustrate a rule, and anything not useful
+for an automated cleaning / feature-engineering agent.
+
+Output plain text. No JSON, no markdown headers.
+"""
+
+
+def summarize_description(model, text: str) -> str:
+    response = model.invoke(f"{SUMMARIZE_DESCRIPTION_PROMPT}\n\n--- Description ---\n{text}\n--- End ---")
+    return getattr(response, "content", str(response)).strip()
+
 PLANNER_PROMPT = """\
 You are an iterative data-improvement agent. Your job is to propose ONE action per turn \
 that is most likely to improve the cross-validation metric on the dataset.
@@ -78,6 +100,7 @@ Look for: leakage, heavy skew, high-cardinality categoricals, missingness patter
 class imbalance, datetime columns to expand, candidate interactions.
 
 Output strict JSON: {"insights": [{"title": "...", "body": "...", "evidence": {...}}, ...]}
+Return raw JSON only. Do NOT wrap in ```json fences.
 """
 
 
@@ -104,6 +127,8 @@ def build_planner_prompt(
 --- Context ---
 Goal: {state.get("goal")}
 Target: {state.get("target")}
+Dataset description (user-provided):
+{(state.get("dataset_description") or "(none)")[:1500]}
 Task: {state.get("task")}
 Metric: {state.get("metric_name")} (direction: {state.get("metric_direction")}, higher-is-better={state.get("metric_direction") == "max"})
 Tolerance: {tolerance}
@@ -137,6 +162,9 @@ def build_reflect_prompt(
     return f"""{REFLECT_PROMPT}
 
 --- Iteration Data ---
+Target: {state.get("target")}
+Dataset description (user-provided):
+{(state.get("dataset_description") or "(none)")[:1500]}
 Action: {action}
 Observation: {observation}
 CV before: {cv_before}
@@ -158,6 +186,8 @@ def build_analyze_prompt(state: dict[str, Any]) -> str:
 
 --- Dataset Profile ---
 Target: {target}
+Dataset description (user-provided):
+{(state.get("dataset_description") or "(none)")[:1500]}
 Task: {task}
 Has test df: {has_test_df}
 
@@ -176,6 +206,8 @@ def build_final_report_prompt(state: dict[str, Any]) -> str:
 --- Run Summary ---
 Goal: {state.get("goal")}
 Target: {state.get("target")}
+Dataset description (user-provided):
+{(state.get("dataset_description") or "(none)")[:1500]}
 Metric: {state.get("metric_name")} ({state.get("metric_direction")})
 Baseline CV: {state.get("baseline_cv_mean")}
 Final CV: {state.get("baseline_cv_mean")}

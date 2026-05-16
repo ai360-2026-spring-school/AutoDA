@@ -48,3 +48,5 @@ class AgentState(TypedDict):
 
     decision: Literal["continue", "finish"]
     final_report: str | None
+    dataset_description: str | None
+    submission_path: str | None

@@ -16,6 +16,7 @@ dependencies = [
     "ydata-profiling>=4.8",
     "pyarrow>=15",
     "category-encoders>=2.6",
+    "langchain-gigachat>=0.3",
 ]
 
 [project.optional-dependencies]

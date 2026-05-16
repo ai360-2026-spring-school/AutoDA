@@ -2,7 +2,7 @@ from typing import Literal
 
 from .timeweb import make_timeweb_model
 
-Provider = Literal["timeweb"]
+Provider = Literal["timeweb", "gigachat"]
 
 
 def make_model(
@@ -17,5 +17,9 @@ def make_model(
             temperature=temperature,
             max_tokens=max_tokens,
         )
+
+    if provider == "gigachat":
+        from .gigachat import make_gigachat_model
+        return make_gigachat_model(model_name, temperature, max_tokens)
 
     raise ValueError(f"Unsupported provider: {provider}")

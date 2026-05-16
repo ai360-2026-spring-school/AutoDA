@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as _dt
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -15,8 +16,7 @@ from .prompts import (
     build_planner_prompt,
     build_reflect_prompt,
     build_final_report_prompt,
-    build_analyze_prompt,
-    ANALYZE_PROMPT,
+    build_analyze_prompt
 )
 
 
@@ -206,19 +206,56 @@ def build_graph(
             })
 
         # --- LLM insights ---
+        n_llm_insights = 0
+        parse_ok = True
+        analyze_prompt = build_analyze_prompt(state)
+        prompt_chars = len(analyze_prompt)
+        response_chars = 0
         try:
-            analyze_prompt = build_analyze_prompt(state)
             response = model.invoke(analyze_prompt)
             content = getattr(response, "content", str(response))
+            response_chars = len(content)
             parsed = parse_json_response(content)
-            llm_insights = parsed.get("insights", [])
-            if isinstance(llm_insights, list):
-                for ins in llm_insights:
-                    if isinstance(ins, dict):
-                        ins.setdefault("source", "llm")
-                        insights.append(ins)
+            if "error" in parsed:
+                parse_ok = False
+                insights.append({
+                    "title": "analyze_node JSON parse failure",
+                    "body": parsed["error"],
+                    "evidence": {"raw_excerpt": parsed.get("raw", "")[:500]},
+                    "source": "analyze_llm_error",
+                })
+            else:
+                llm_insights = parsed.get("insights", [])
+                if isinstance(llm_insights, list):
+                    for ins in llm_insights:
+                        if isinstance(ins, dict):
+                            ins.setdefault("source", "llm")
+                            insights.append(ins)
+                    n_llm_insights = len(llm_insights)
+        except Exception as exc:
+            parse_ok = False
+            insights.append({
+                "title": "analyze_node exception",
+                "body": repr(exc),
+                "evidence": {},
+                "source": "analyze_llm_error",
+            })
+
+        # write debug log
+        try:
+            log_path = reports_dir / "analyze_debug.log"
+            log_entry = json.dumps({
+                "timestamp": _dt.datetime.utcnow().isoformat(),
+                "prompt_chars": prompt_chars,
+                "response_chars": response_chars,
+                "parse_ok": parse_ok,
+                "n_deterministic_insights": len([i for i in insights if i.get("source") in ("deterministic",)]),
+                "n_llm_insights": n_llm_insights,
+            })
+            with log_path.open("a") as lf:
+                lf.write(log_entry + "\n")
         except Exception:
-            pass  # graceful degradation
+            pass
 
         return {"insights": insights, "has_test_df": context.test_df is not None}
 
@@ -509,6 +546,51 @@ def build_graph(
 
         return {"final_report": report}
 
+    def submit_node(state: AgentState) -> dict[str, Any]:
+        import pandas as _pd
+
+        if context.current_test_df is None:
+            return {}
+
+        target = state["target"]
+        X_train = context.current_df.drop(columns=[target], errors="ignore")
+        y_train = context.current_df[target]
+        X_test = context.current_test_df
+
+        train_cols = set(X_train.columns)
+        test_cols = set(X_test.columns)
+        if train_cols != test_cols:
+            missing_in_test = train_cols - test_cols
+            extra_in_test = test_cols - train_cols
+            raise RuntimeError(
+                f"Feature mismatch between train and test.\n"
+                f"Missing in test: {missing_in_test}\nExtra in test: {extra_in_test}"
+            )
+
+        model_fitted = evaluator.fit_full(X_train, y_train)
+
+        cat_features = evaluator._detect_cat_features(X_test)
+        X_test_clean = evaluator._prepare_X(X_test, cat_features)
+
+        if evaluator.task == "binary":
+            preds = model_fitted.predict_proba(X_test_clean)[:, 1]
+        elif evaluator.task == "multiclass":
+            preds = model_fitted.predict(X_test_clean).ravel()
+        else:
+            preds = model_fitted.predict(X_test_clean)
+
+        id_name = context.test_id_column_name or "id"
+        if context.test_id_values is not None:
+            id_vals = context.test_id_values.values
+        else:
+            id_vals = range(len(preds))
+
+        sub = _pd.DataFrame({id_name: id_vals, target: preds})
+        sub_path = reports_dir / "submission.csv"
+        sub.to_csv(sub_path, index=False)
+
+        return {"submission_path": str(sub_path)}
+
     def route_after_planner(state: AgentState) -> Literal["apply", "final_report"]:
         if state.get("decision") == "finish":
             return "final_report"
@@ -519,6 +601,9 @@ def build_graph(
             return "final_report"
         return "planner"
 
+    def route_after_final(state: AgentState) -> str:
+        return "submit" if state.get("has_test_df") else "__end__"
+
     graph = StateGraph(AgentState)
 
     graph.add_node("profile", profile_node)
@@ -528,6 +613,7 @@ def build_graph(
     graph.add_node("evaluate", evaluate_node)
     graph.add_node("reflect", reflect_node)
     graph.add_node("final_report", final_report_node)
+    graph.add_node("submit", submit_node)
 
     graph.add_edge(START, "profile")
     graph.add_edge("profile", "analyze")
@@ -540,6 +626,11 @@ def build_graph(
     graph.add_conditional_edges(
         "reflect", route_after_reflect, {"planner": "planner", "final_report": "final_report"}
     )
-    graph.add_edge("final_report", END)
+    graph.add_conditional_edges(
+        "final_report",
+        route_after_final,
+        {"submit": "submit", "__end__": END},
+    )
+    graph.add_edge("submit", END)
 
     return graph.compile()

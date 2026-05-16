@@ -76,10 +76,12 @@ class CatBoostEvaluator:
         task: Literal["binary", "multiclass", "regression"],
         metric_name: str,
         n_splits: int = DEFAULT_N_SPLITS,
+        history_path: Path | None = None,
     ):
         self.task = task
         self.metric_name = metric_name
         self.n_splits = n_splits
+        self.history_path = history_path
         self.metric_direction: Literal["max", "min"] = _default_metric(task)[1]
         if metric_name in ("roc_auc",):
             self.metric_direction = "max"
@@ -99,6 +101,16 @@ class CatBoostEvaluator:
         metric_name, _ = _default_metric(task)
         return cls(task=task, metric_name=metric_name, n_splits=n_splits)
 
+    def _detect_cat_features(self, X: pd.DataFrame) -> list[str]:
+        return [c for c in X.columns if pd.api.types.is_object_dtype(X[c]) or hasattr(X[c].dtype, "categories")]
+
+    def _prepare_X(self, X: pd.DataFrame, cat_features: list[str]) -> pd.DataFrame:
+        """Fill NaN in categorical columns (CatBoost rejects them)."""
+        X = X.reset_index(drop=True).copy()
+        if cat_features:
+            X[cat_features] = X[cat_features].fillna("").astype(str)
+        return X
+
     def cv(
         self,
         X: pd.DataFrame,
@@ -109,7 +121,7 @@ class CatBoostEvaluator:
         from catboost import CatBoostClassifier, CatBoostRegressor
 
         if cat_features is None:
-            cat_features = [c for c in X.columns if pd.api.types.is_object_dtype(X[c]) or hasattr(X[c].dtype, "categories")]
+            cat_features = self._detect_cat_features(X)
 
         _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss"}
         cb_metric = _metric_map.get(self.metric_name, self.metric_name)
@@ -130,12 +142,8 @@ class CatBoostEvaluator:
         scores: list[float] = []
         last_importances: dict[str, float] | None = None
 
-        X_reset = X.reset_index(drop=True).copy()
+        X_reset = self._prepare_X(X, cat_features)
         y_reset = y.reset_index(drop=True)
-
-        # CatBoost rejects NaN in categorical columns — fill with empty string
-        if cat_features:
-            X_reset[cat_features] = X_reset[cat_features].fillna("").astype(str)
 
         for train_idx, val_idx in splitter.split(X_reset, y_reset):
             X_tr, X_val = X_reset.iloc[train_idx], X_reset.iloc[val_idx]
@@ -181,8 +189,35 @@ class CatBoostEvaluator:
 
         return result
 
+    def fit_full(self, X: pd.DataFrame, y: pd.Series):
+        """Fit one model on all data (no CV, no early stopping). Used for submission."""
+        from catboost import CatBoostClassifier, CatBoostRegressor
+
+        cat_features = self._detect_cat_features(X)
+        X = self._prepare_X(X, cat_features)
+        y = y.reset_index(drop=True)
+
+        _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss"}
+        cb_metric = _metric_map.get(self.metric_name, self.metric_name)
+
+        full_params = dict(COMMON_PARAMS)
+        full_params.pop("early_stopping_rounds", None)  # no early stop for full fit
+
+        if self.task in ("binary", "multiclass"):
+            loss = "Logloss" if self.task == "binary" else "MultiClass"
+            model_cls = CatBoostClassifier
+            extra = dict(loss_function=loss, eval_metric=cb_metric if self.task == "binary" else "Accuracy")
+        else:
+            model_cls = CatBoostRegressor
+            extra = dict(loss_function="RMSE", eval_metric=self.metric_name.upper())
+
+        model = model_cls(**full_params, **extra)
+        model.fit(X, y, cat_features=cat_features)
+        return model
+
     def _append_cv_history(self, record: dict[str, Any]) -> None:
-        path = Path("reports/cv_history.jsonl")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
+        if self.history_path is None:
+            return
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.history_path.open("a") as f:
             f.write(json.dumps(record) + "\n")

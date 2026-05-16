@@ -18,6 +18,6 @@ def apply_pipeline(df: pd.DataFrame, transformers: list[Transformer]) -> pd.Data
 
 def replay(
     test_df: pd.DataFrame,
-    pipeline_path: Path = Path("reports/fitted_pipeline.pkl"),
+    pipeline_path: Path,
 ) -> pd.DataFrame:
     return apply_pipeline(test_df, load_pipeline(pipeline_path))

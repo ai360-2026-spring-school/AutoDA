@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,14 @@ from .graph import build_graph
 from .models import make_model
 from .state import Iteration
 from .actions.registry import kind_of
+from .prompts import (
+    DESCRIPTION_TOKEN_BUDGET,
+    summarize_description,
+)
+
+
+def sanitize_target(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "target"
 
 
 @dataclass
@@ -30,12 +39,14 @@ class AgentResult:
     fitted_transformers: list
     pipeline_path: Path
     raw_state: dict[str, Any]
+    submission_path: Path | None
+    submission_df: pd.DataFrame | None
 
 
 class PDAgent:
     def __init__(
         self,
-        provider: Literal["timeweb"] = "timeweb",
+        provider: Literal["timeweb", "gigachat"] = "timeweb",
         model: str | None = None,
         max_iterations: int = 20,
         tolerance: float = 1e-4,
@@ -62,9 +73,54 @@ class PDAgent:
         goal: str,
         test_df: pd.DataFrame | None = None,
         reports_dir: Path = Path("reports"),
+        *,
+        description: str | Path | None = None,
+        id_column: str | None = None,
     ) -> AgentResult:
         dataset_id = str(uuid.uuid4())
         reports_dir = Path(reports_dir)
+        reports_dir = reports_dir / sanitize_target(target)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build LLM once — may be needed early for description summarisation
+        llm = make_model(
+            provider=self.provider,
+            model_name=self.model_name,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+
+        # --- T16: resolve dataset description ---
+        resolved_description: str | None = None
+        if description is not None:
+            # check if it's a path
+            if isinstance(description, Path) or (
+                isinstance(description, str) and Path(description).exists()
+            ):
+                raw_text = Path(description).read_text()
+            else:
+                raw_text = str(description)
+            raw_text = raw_text.strip()
+            if raw_text:
+                (reports_dir / "dataset_description.txt").write_text(raw_text)
+                if len(raw_text) > DESCRIPTION_TOKEN_BUDGET:
+                    raw_text = summarize_description(llm, raw_text)
+                    (reports_dir / "dataset_description.summary.txt").write_text(raw_text)
+                resolved_description = raw_text
+
+        # --- T19: handle id column before constructing DatasetContext ---
+        test_id_values: pd.Series | None = None
+        test_id_column_name: str | None = None
+        if test_df is not None:
+            test_df = test_df.copy()
+            id_col = id_column or ("id" if "id" in test_df.columns else None)
+            if id_col is not None and id_col in test_df.columns:
+                test_id_column_name = id_col
+                test_id_values = test_df[id_col].copy()
+                test_df = test_df.drop(columns=[id_col])
+            else:
+                test_id_column_name = test_df.index.name or "id"
+                test_id_values = pd.Series(test_df.index, name=test_id_column_name)
 
         context = DatasetContext(
             dataset_id=dataset_id,
@@ -72,6 +128,10 @@ class PDAgent:
             target=target,
             test_df=test_df,
         )
+
+        # Set id metadata on context
+        context.test_id_values = test_id_values
+        context.test_id_column_name = test_id_column_name
 
         evaluator = CatBoostEvaluator.auto(
             df[target],
@@ -82,12 +142,8 @@ class PDAgent:
         if self.metric:
             evaluator.metric_name = self.metric
 
-        llm = make_model(
-            provider=self.provider,
-            model_name=self.model_name,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
+        # --- T15: point evaluator history at per-target subfolder ---
+        evaluator.history_path = reports_dir / "cv_history.jsonl"
 
         app = build_graph(
             model=llm,
@@ -120,13 +176,27 @@ class PDAgent:
             "info_tool_results": [],
             "decision": "continue",
             "final_report": None,
+            "dataset_description": resolved_description,
+            "submission_path": None,
         }
 
         final_state: dict[str, Any] | None = None
         last_printed_step = 0
+        analyze_printed = False
 
         for state in app.stream(initial_state, stream_mode="values"):
             final_state = state
+
+            # print analyze summary once when insights arrive
+            if not analyze_printed and state.get("insights"):
+                det = sum(1 for i in state["insights"] if i.get("source") == "deterministic")
+                llm_c = sum(1 for i in state["insights"] if i.get("source") == "llm")
+                err_c = sum(1 for i in state["insights"] if i.get("source") == "analyze_llm_error")
+                if det + llm_c + err_c > 0:
+                    suffix = f" + {err_c} parse error(s)" if err_c else ""
+                    print(f"[analyze] deterministic={det}  llm={llm_c}{suffix}")
+                    analyze_printed = True
+
             iterations = state.get("iterations", [])
 
             for it in iterations:
@@ -172,6 +242,10 @@ class PDAgent:
 
         pipeline_path = reports_dir / "fitted_pipeline.pkl"
 
+        sub_path_str = final_state.get("submission_path")
+        sub_path = Path(sub_path_str) if sub_path_str else None
+        sub_df = pd.read_csv(sub_path) if sub_path and sub_path.exists() else None
+
         return AgentResult(
             report=final_state.get("final_report") or "",
             iterations=final_state.get("iterations", []),
@@ -186,4 +260,6 @@ class PDAgent:
             fitted_transformers=context.fitted_transformers,
             pipeline_path=pipeline_path,
             raw_state=final_state,
+            submission_path=sub_path,
+            submission_df=sub_df,
         )
