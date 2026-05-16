@@ -10,8 +10,8 @@ Rules:
 - The change will be applied to a working copy of the dataset. CatBoost CV will run and \
   the change is kept only if it improves the metric by more than {tolerance} (absolute). \
   Otherwise it is rolled back — so prefer safe, targeted changes.
-- When you want to remember a hypothesis for future iterations, use `record_insight` \
-  (it does NOT change the data, so it is always kept).
+- Operations with kind="info" are read-only probes — they do NOT change the data and are \
+  always kept. Use them to gather information before committing to a transformation.
 - If you believe no further improvement is possible, set "stop": true.
 
 Output strict JSON — no markdown, no commentary:
@@ -71,6 +71,15 @@ Structure:
 Use only the information provided. Do not invent facts.
 """
 
+ANALYZE_PROMPT = """\
+You are reviewing the initial profile of a tabular dataset before any cleaning or FE.
+Produce 3-7 structured insights that will help an iterative agent improve CV.
+Look for: leakage, heavy skew, high-cardinality categoricals, missingness patterns,
+class imbalance, datetime columns to expand, candidate interactions.
+
+Output strict JSON: {"insights": [{"title": "...", "body": "...", "evidence": {...}}, ...]}
+"""
+
 
 def build_planner_prompt(
     state: dict[str, Any],
@@ -100,7 +109,7 @@ Metric: {state.get("metric_name")} (direction: {state.get("metric_direction")}, 
 Tolerance: {tolerance}
 Baseline CV: mean={baseline_mean}, std={baseline_std}
 Current step: {state.get("current_step", 0)}
-No-improve streak: {state.get("no_improve_streak", 0)}
+Has test df: {state.get("has_test_df", False)}
 
 Dataset profile:
 {profile_str}
@@ -136,6 +145,24 @@ CV delta (signed improvement): {cv_delta}
 Decision: {decision}
 Error: {state.get("last_error")}
 --- End ---
+"""
+
+
+def build_analyze_prompt(state: dict[str, Any]) -> str:
+    profile_str = json.dumps(state.get("dataset_profile", {}), ensure_ascii=False)[:8000]
+    target = state.get("target", "")
+    task = state.get("task", "")
+    has_test_df = state.get("has_test_df", False)
+
+    return f"""{ANALYZE_PROMPT}
+
+--- Dataset Profile ---
+Target: {target}
+Task: {task}
+Has test df: {has_test_df}
+
+{profile_str}
+--- End Profile ---
 """
 
 

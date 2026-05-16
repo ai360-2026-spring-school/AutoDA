@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -8,8 +10,14 @@ from .state import AgentState, Iteration
 from .dataset import DatasetContext
 from .evaluator import CatBoostEvaluator, is_keep, CVResult
 from .profiler import profile_dataset
-from .actions.registry import REGISTRY, SCHEMA
-from .prompts import build_planner_prompt, build_reflect_prompt, build_final_report_prompt
+from .actions.registry import REGISTRY, SCHEMA, kind_of
+from .prompts import (
+    build_planner_prompt,
+    build_reflect_prompt,
+    build_final_report_prompt,
+    build_analyze_prompt,
+    ANALYZE_PROMPT,
+)
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
@@ -36,7 +44,6 @@ def build_graph(
     evaluator: CatBoostEvaluator,
     *,
     max_iterations: int = 20,
-    patience: int = 4,
     tolerance: float = 1e-4,
     reports_dir: Path = Path("reports"),
 ):
@@ -89,17 +96,131 @@ def build_graph(
             "metric_direction": evaluator.metric_direction,
             "baseline_cv_mean": baseline.mean,
             "baseline_cv_std": baseline.std,
-            "no_improve_streak": 0,
+            "has_test_df": context.test_df is not None,
             "current_step": 0,
             "iterations": [baseline_iter],
             "insights": [],
             "applied_actions": [],
+            "applied_pipeline": [],
+            "info_tool_results": [],
             "decision": "continue",
             "last_error": None,
             "final_report": None,
             "proposed_action": None,
             "last_observation": None,
         }
+
+    def analyze_node(state: AgentState) -> dict[str, Any]:
+        """Deterministic + LLM analysis of the initial profile."""
+        profile = state.get("dataset_profile", {})
+        columns = profile.get("columns", [])
+        target = state["target"]
+        task = state["task"]
+        insights: list[dict[str, Any]] = []
+
+        # --- deterministic insights ---
+        # Columns with >50% missing
+        high_missing = [
+            c["name"] for c in columns
+            if c["name"] != target and c.get("missing_rate", 0) > 0.5
+        ]
+        if high_missing:
+            insights.append({
+                "title": "High missingness columns",
+                "body": f"Columns with >50% missing values: {high_missing}. Consider imputing or dropping.",
+                "evidence": {"columns": high_missing},
+                "source": "deterministic",
+            })
+
+        # Suspected leakage: unique_rate > 0.9 and not target
+        n_rows = profile.get("shape", [0])[0] or 1
+        leakage_candidates = []
+        for c in columns:
+            if c["name"] == target:
+                continue
+            unique_rate = c.get("n_unique", 0) / n_rows
+            if unique_rate > 0.9:
+                leakage_candidates.append(c["name"])
+        if leakage_candidates:
+            insights.append({
+                "title": "Potential leakage columns (high unique rate)",
+                "body": f"Columns with unique_rate > 0.9 (not target): {leakage_candidates}. May be IDs or timestamps.",
+                "evidence": {"columns": leakage_candidates},
+                "source": "deterministic",
+            })
+
+        # High cardinality categorical cols (n_unique > 20, non-numeric)
+        high_card_cats = [
+            c["name"] for c in columns
+            if c["name"] != target
+            and c.get("n_unique", 0) > 20
+            and "int" not in c.get("dtype", "")
+            and "float" not in c.get("dtype", "")
+        ]
+        if high_card_cats:
+            insights.append({
+                "title": "High-cardinality categorical columns",
+                "body": f"Categorical cols with >20 unique values: {high_card_cats}. Use frequency or target encoding.",
+                "evidence": {"columns": high_card_cats},
+                "source": "deterministic",
+            })
+
+        # Datetime-typed columns
+        datetime_cols = [
+            c["name"] for c in columns
+            if "datetime" in c.get("dtype", "") or "date" in c.get("dtype", "").lower()
+        ]
+        if datetime_cols:
+            insights.append({
+                "title": "Datetime columns detected",
+                "body": f"Datetime columns: {datetime_cols}. Consider expand_datetime to extract year/month/dow/hour/is_weekend.",
+                "evidence": {"columns": datetime_cols},
+                "source": "deterministic",
+            })
+
+        # Class imbalance for binary tasks
+        if task == "binary":
+            target_col_info = next((c for c in columns if c["name"] == target), None)
+            if target_col_info and "top_values" in target_col_info:
+                top_vals = target_col_info["top_values"]
+                if top_vals:
+                    total = sum(top_vals.values())
+                    minority_frac = min(top_vals.values()) / total if total > 0 else 0.5
+                    if minority_frac < 0.3:
+                        insights.append({
+                            "title": "Class imbalance detected",
+                            "body": f"Minority class fraction: {minority_frac:.2%}. Consider class-weight strategies.",
+                            "evidence": {"minority_fraction": minority_frac, "distribution": top_vals},
+                            "source": "deterministic",
+                        })
+
+        # Strong correlations between numeric features (detected from profile stats)
+        # We can't compute full corr matrix here, but we note columns with similar stats
+        numeric_cols = [c for c in columns if "stats" in c and c["name"] != target]
+        if len(numeric_cols) >= 2:
+            insights.append({
+                "title": "Numeric features available",
+                "body": f"{len(numeric_cols)} numeric features found. Consider drop_high_corr to remove redundant features.",
+                "evidence": {"count": len(numeric_cols)},
+                "source": "deterministic",
+            })
+
+        # --- LLM insights ---
+        try:
+            analyze_prompt = build_analyze_prompt(state)
+            response = model.invoke(analyze_prompt)
+            content = getattr(response, "content", str(response))
+            parsed = parse_json_response(content)
+            llm_insights = parsed.get("insights", [])
+            if isinstance(llm_insights, list):
+                for ins in llm_insights:
+                    if isinstance(ins, dict):
+                        ins.setdefault("source", "llm")
+                        insights.append(ins)
+        except Exception:
+            pass  # graceful degradation
+
+        return {"insights": insights, "has_test_df": context.test_df is not None}
 
     def planner_node(state: AgentState) -> dict[str, Any]:
         if state.get("proposed_action", {}) and state["proposed_action"].get("stop"):
@@ -136,17 +257,44 @@ def build_graph(
                 "last_error": f"unknown operation: {op!r}",
             }
 
-        # drop_low_importance needs feature importances injected
-        if op == "drop_low_importance":
-            args = dict(args, feature_importances=evaluator.last_feature_importances_)
-
+        # determine kind, defaulting to transformer on error
         try:
-            df_new, observation = REGISTRY[op](context.current_df, state["target"], **args)
-            context.working_df = df_new
-            return {"last_observation": observation, "last_error": None}
-        except Exception as e:
-            context.working_df = None
-            return {"last_observation": None, "last_error": repr(e)}
+            op_kind = kind_of(op)
+        except KeyError:
+            op_kind = "transformer"
+
+        if op_kind == "info":
+            # info tools: call with task kwarg, return observation dict directly
+            try:
+                obs = REGISTRY[op](context.current_df, state["target"], task=state["task"], **args)
+                return {"last_observation": obs, "last_error": None}
+            except Exception as e:
+                return {"last_observation": None, "last_error": repr(e)}
+        else:
+            # transformer: inject feature_importances for drop_low_importance
+            if op == "drop_low_importance":
+                args = dict(args, feature_importances=evaluator.last_feature_importances_)
+
+            try:
+                df_new, transformer, observation = REGISTRY[op](context.current_df, state["target"], **args)
+                context.working_df = df_new
+                context.working_transformer = transformer
+
+                # sync test df
+                if context.current_test_df is not None:
+                    try:
+                        context.working_test_df = transformer.apply(context.current_test_df)
+                    except Exception as e:
+                        context.working_test_df = None
+                        observation = dict(observation)
+                        observation["test_apply_error"] = repr(e)
+
+                return {"last_observation": observation, "last_error": None}
+            except Exception as e:
+                context.working_df = None
+                context.working_transformer = None
+                context.working_test_df = None
+                return {"last_observation": None, "last_error": repr(e)}
 
     def evaluate_node(state: AgentState) -> dict[str, Any]:
         # pass-through on error or when apply didn't produce a df
@@ -155,9 +303,12 @@ def build_graph(
 
         op = (state.get("proposed_action") or {}).get("operation", "")
 
-        # insight actions don't change df → skip CV
-        if op == "record_insight":
-            return {}
+        # info operations don't change the df — skip CV
+        try:
+            if kind_of(op) == "info":
+                return {}
+        except KeyError:
+            pass  # unknown op — fall through to CV
 
         target = state["target"]
         X = context.working_df.drop(columns=[target], errors="ignore")
@@ -181,7 +332,14 @@ def build_graph(
         obs = state.get("last_observation") or {}
         step = state.get("current_step", 0) + 1
 
-        cv_result_dict = obs.pop("_cv_result", None) if obs else None
+        # determine operation kind
+        try:
+            op_kind = kind_of(op)
+        except KeyError:
+            op_kind = "transformer"
+
+        obs = dict(obs)  # make mutable
+        cv_result_dict = obs.pop("_cv_result", None)
         cv_after_result: CVResult | None = None
         if cv_result_dict:
             cv_after_result = CVResult(**cv_result_dict)
@@ -191,11 +349,16 @@ def build_graph(
         cv_after = cv_after_result.mean if cv_after_result else None
         cv_std_after = cv_after_result.std if cv_after_result else None
 
+        # determine iteration decision
         if error:
             iter_decision = "error"
             cv_delta = None
-        elif op == "record_insight":
-            iter_decision = "keep"
+        elif op_kind == "info":
+            # info ops are always "keep" (or error if obs has "error")
+            if obs.get("error"):
+                iter_decision = "error"
+            else:
+                iter_decision = "keep"
             cv_delta = None
         elif cv_after_result and base:
             kept = is_keep(cv_after_result, base, tol=tolerance)
@@ -205,7 +368,7 @@ def build_graph(
             iter_decision = "error"
             cv_delta = None
 
-        # ask LLM to reflect
+        # LLM reflection
         reflect_prompt = build_reflect_prompt(
             state,
             cv_before=cv_before,
@@ -247,11 +410,38 @@ def build_graph(
         }
 
         if iter_decision == "keep":
-            if op != "record_insight" and cv_after_result:
+            if op_kind == "info":
+                # record info tool result as insight
+                info_insight = {
+                    "title": f"{op} result",
+                    "body": obs.get("summary", str(obs)[:200]),
+                    "evidence": obs,
+                    "source": "info_tool",
+                }
+                updates["insights"] = [info_insight]
+                updates["info_tool_results"] = [{"operation": op, "args": action.get("args", {}), "result": obs}]
+            else:
+                # transformer keep
                 context.current_df = context.working_df
                 baseline_cell[0] = cv_after_result
                 updates["baseline_cv_mean"] = cv_after_result.mean
                 updates["baseline_cv_std"] = cv_after_result.std
+
+                # append to fitted pipeline
+                context.fitted_transformers.append(context.working_transformer)
+                transformer_id = len(context.fitted_transformers) - 1
+                updates["applied_pipeline"] = [{
+                    "step": step,
+                    "operation": op,
+                    "args": action.get("args", {}),
+                    "transformer_id": transformer_id,
+                }]
+
+                # promote working test df
+                if context.working_test_df is not None:
+                    context.current_test_df = context.working_test_df
+
+                updates["applied_actions"] = [action]
 
                 # re-profile on keep
                 try:
@@ -261,25 +451,26 @@ def build_graph(
                 except Exception:
                     pass
 
-            updates["no_improve_streak"] = 0
-            updates["applied_actions"] = [action]
         else:
+            # reject or error
             context.working_df = None
-            updates["no_improve_streak"] = state.get("no_improve_streak", 0) + 1
+            context.working_transformer = None
+            context.working_test_df = None
 
         if new_insight:
-            updates["insights"] = [new_insight]
+            updates.setdefault("insights", [])
+            updates["insights"] = updates.get("insights", []) + [new_insight]
 
         # stop conditions
-        no_improve = updates.get("no_improve_streak", state.get("no_improve_streak", 0))
-        if step >= max_iterations or no_improve >= patience or action.get("stop"):
-            updates["decision"] = "finish"
-        else:
-            updates["decision"] = "continue"
+        stop = step >= max_iterations or bool(action.get("stop"))
+        updates["decision"] = "finish" if stop else "continue"
 
         return updates
 
     def final_report_node(state: AgentState) -> dict[str, Any]:
+        import pickle as _pickle
+        import json as _json
+
         prompt = build_final_report_prompt(state)
         response = model.invoke(prompt)
         report = getattr(response, "content", str(response))
@@ -290,6 +481,31 @@ def build_graph(
             context.current_df.to_parquet(reports_dir / "final_dataset.parquet", index=False)
         except Exception:
             pass
+
+        # persist fitted pipeline
+        try:
+            with (reports_dir / "fitted_pipeline.pkl").open("wb") as f:
+                _pickle.dump(context.fitted_transformers, f)
+        except Exception:
+            pass
+
+        try:
+            (reports_dir / "pipeline.json").write_text(
+                _json.dumps(
+                    [{"operation": t.operation, "args": t.args} for t in context.fitted_transformers],
+                    indent=2,
+                )
+            )
+        except Exception:
+            pass
+
+        if context.current_test_df is not None:
+            try:
+                context.current_test_df.to_parquet(
+                    reports_dir / "final_test_dataset.parquet", index=False
+                )
+            except Exception:
+                pass
 
         return {"final_report": report}
 
@@ -306,6 +522,7 @@ def build_graph(
     graph = StateGraph(AgentState)
 
     graph.add_node("profile", profile_node)
+    graph.add_node("analyze", analyze_node)
     graph.add_node("planner", planner_node)
     graph.add_node("apply", apply_node)
     graph.add_node("evaluate", evaluate_node)
@@ -313,11 +530,16 @@ def build_graph(
     graph.add_node("final_report", final_report_node)
 
     graph.add_edge(START, "profile")
-    graph.add_edge("profile", "planner")
-    graph.add_conditional_edges("planner", route_after_planner, {"apply": "apply", "final_report": "final_report"})
+    graph.add_edge("profile", "analyze")
+    graph.add_edge("analyze", "planner")
+    graph.add_conditional_edges(
+        "planner", route_after_planner, {"apply": "apply", "final_report": "final_report"}
+    )
     graph.add_edge("apply", "evaluate")
     graph.add_edge("evaluate", "reflect")
-    graph.add_conditional_edges("reflect", route_after_reflect, {"planner": "planner", "final_report": "final_report"})
+    graph.add_conditional_edges(
+        "reflect", route_after_reflect, {"planner": "planner", "final_report": "final_report"}
+    )
     graph.add_edge("final_report", END)
 
     return graph.compile()

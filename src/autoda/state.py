@@ -31,7 +31,8 @@ class AgentState(TypedDict):
 
     baseline_cv_mean: float | None
     baseline_cv_std: float | None
-    no_improve_streak: int
+
+    has_test_df: bool
 
     iterations: Annotated[list[Iteration], operator.add]
     current_step: int
@@ -42,6 +43,8 @@ class AgentState(TypedDict):
 
     insights: Annotated[list[dict[str, Any]], operator.add]
     applied_actions: Annotated[list[dict[str, Any]], operator.add]
+    applied_pipeline: Annotated[list[dict[str, Any]], operator.add]
+    info_tool_results: Annotated[list[dict[str, Any]], operator.add]
 
     decision: Literal["continue", "finish"]
     final_report: str | None

@@ -1,14 +1,111 @@
+from __future__ import annotations
+
+import functools
 from typing import Any
 import numpy as np
 import pandas as pd
 
+from autoda.transformer import Transformer
+
+
+# ---------------------------------------------------------------------------
+# apply helpers (top-level, picklable)
+# ---------------------------------------------------------------------------
+
+def _apply_expand_datetime(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    col: str = state["column"]
+    parts: list[str] = state["parts"]
+    if col not in df.columns:
+        return df
+    dt = pd.to_datetime(df[col], errors="coerce")
+    if "year" in parts:
+        df[f"{col}__year"] = dt.dt.year
+    if "month" in parts:
+        df[f"{col}__month"] = dt.dt.month
+    if "dow" in parts:
+        df[f"{col}__dow"] = dt.dt.dayofweek
+    if "hour" in parts:
+        df[f"{col}__hour"] = dt.dt.hour
+    if "is_weekend" in parts:
+        df[f"{col}__is_weekend"] = (dt.dt.dayofweek >= 5).astype(int)
+    return df
+
+
+def _apply_binarize_missing(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in state["columns"]:
+        if col in df.columns:
+            df[f"{col}__isna"] = df[col].isna().astype(int)
+    return df
+
+
+def _apply_log_transform(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    plus_one: bool = state["plus_one"]
+    for col in state["columns"]:
+        if col not in df.columns:
+            continue
+        vals = df[col] + 1 if plus_one else df[col]
+        # clip non-positive values to a small positive number instead of raising
+        vals = vals.clip(lower=1e-9)
+        df[col] = np.log(vals)
+    return df
+
+
+def _apply_bin_numeric(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    col: str = state["column"]
+    bin_edges: list[float] = state["bin_edges"]
+    new_col: str = state["new_col"]
+    if col not in df.columns:
+        return df
+    df[new_col] = pd.cut(df[col], bins=bin_edges, labels=False, include_lowest=True)
+    return df
+
+
+def _apply_interaction(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    a, b = state["cols"]
+    op: str = state["op"]
+    new_col: str = state["new_col"]
+    if a not in df.columns or b not in df.columns:
+        return df
+    if op == "mul":
+        df[new_col] = df[a] * df[b]
+    elif op == "div":
+        df[new_col] = df[a] / df[b].replace(0, float("nan"))
+    elif op == "add":
+        df[new_col] = df[a] + df[b]
+    else:
+        df[new_col] = df[a] - df[b]
+    return df
+
+
+def _apply_group_aggregate(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    by: str = state["by"]
+    new_col: str = state["new_col"]
+    mapping: dict = state["mapping"]
+    default: float = state["default"]
+    # value column may be absent on test (it's the aggregation source)
+    # we just map from the by column using precomputed mapping
+    if by not in df.columns:
+        return df
+    df[new_col] = df[by].map(mapping).fillna(default)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# public action functions — return (df, Transformer, observation)
+# ---------------------------------------------------------------------------
 
 def expand_datetime(
     df: pd.DataFrame,
     target: str,
     column: str,
     parts: list[str] | None = None,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
 
@@ -18,45 +115,41 @@ def expand_datetime(
     if invalid:
         raise ValueError(f"invalid parts: {invalid}")
 
-    df = df.copy()
-    dt = pd.to_datetime(df[column], errors="coerce")
-    added: list[str] = []
+    state: dict[str, Any] = {"column": column, "parts": parts}
+    df_out = _apply_expand_datetime(state, df)
+    added = [c for c in df_out.columns if c not in df.columns]
 
-    if "year" in parts:
-        df[f"{column}__year"] = dt.dt.year
-        added.append(f"{column}__year")
-    if "month" in parts:
-        df[f"{column}__month"] = dt.dt.month
-        added.append(f"{column}__month")
-    if "dow" in parts:
-        df[f"{column}__dow"] = dt.dt.dayofweek
-        added.append(f"{column}__dow")
-    if "hour" in parts:
-        df[f"{column}__hour"] = dt.dt.hour
-        added.append(f"{column}__hour")
-    if "is_weekend" in parts:
-        df[f"{column}__is_weekend"] = (dt.dt.dayofweek >= 5).astype(int)
-        added.append(f"{column}__is_weekend")
-
-    return df, {"changed_columns": added, "summary": f"expanded {column!r} into {added}"}
+    transformer = Transformer(
+        operation="expand_datetime",
+        args={"column": column, "parts": parts},
+        state=state,
+        apply=functools.partial(_apply_expand_datetime, state),
+    )
+    return df_out, transformer, {
+        "changed_columns": added,
+        "summary": f"expanded {column!r} into {added}",
+    }
 
 
 def binarize_missing(
     df: pd.DataFrame,
     target: str,
     columns: list[str],
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    df = df.copy()
-    added: list[str] = []
+) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    state: dict[str, Any] = {"columns": columns}
+    df_out = _apply_binarize_missing(state, df)
+    added = [f"{c}__isna" for c in columns if c in df.columns]
 
-    for col in columns:
-        if col not in df.columns:
-            raise ValueError(f"column not found: {col!r}")
-        new_col = f"{col}__isna"
-        df[new_col] = df[col].isna().astype(int)
-        added.append(new_col)
-
-    return df, {"changed_columns": added, "summary": f"added {len(added)} missing-indicator column(s)"}
+    transformer = Transformer(
+        operation="binarize_missing",
+        args={"columns": columns},
+        state=state,
+        apply=functools.partial(_apply_binarize_missing, state),
+    )
+    return df_out, transformer, {
+        "changed_columns": added,
+        "summary": f"added {len(added)} missing-indicator column(s)",
+    }
 
 
 def log_transform(
@@ -64,10 +157,8 @@ def log_transform(
     target: str,
     columns: list[str],
     plus_one: bool = True,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    df = df.copy()
-    changed: list[str] = []
-
+) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    valid_cols = []
     for col in columns:
         if col not in df.columns:
             raise ValueError(f"column not found: {col!r}")
@@ -75,15 +166,21 @@ def log_transform(
             raise ValueError("cannot transform the target column")
         if not pd.api.types.is_numeric_dtype(df[col]):
             raise ValueError(f"column {col!r} is not numeric")
+        valid_cols.append(col)
 
-        vals = df[col] + 1 if plus_one else df[col]
-        if (vals <= 0).any():
-            raise ValueError(f"column {col!r} has non-positive values after shift; cannot log-transform")
+    state: dict[str, Any] = {"columns": valid_cols, "plus_one": plus_one}
+    df_out = _apply_log_transform(state, df)
 
-        df[col] = np.log(vals)
-        changed.append(col)
-
-    return df, {"changed_columns": changed, "summary": f"log-transformed {len(changed)} column(s)"}
+    transformer = Transformer(
+        operation="log_transform",
+        args={"columns": columns, "plus_one": plus_one},
+        state=state,
+        apply=functools.partial(_apply_log_transform, state),
+    )
+    return df_out, transformer, {
+        "changed_columns": valid_cols,
+        "summary": f"log-transformed {len(valid_cols)} column(s)",
+    }
 
 
 def bin_numeric(
@@ -92,7 +189,7 @@ def bin_numeric(
     column: str,
     n_bins: int = 5,
     strategy: str = "quantile",
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
     if column == target:
@@ -102,15 +199,26 @@ def bin_numeric(
     if not pd.api.types.is_numeric_dtype(df[column]):
         raise ValueError(f"column {column!r} is not numeric")
 
-    df = df.copy()
     new_col = f"{column}__bin"
-
     if strategy == "quantile":
-        df[new_col] = pd.qcut(df[column], q=n_bins, labels=False, duplicates="drop")
+        _, bin_edges = pd.qcut(df[column], q=n_bins, retbins=True, duplicates="drop")
     else:
-        df[new_col] = pd.cut(df[column], bins=n_bins, labels=False)
+        _, bin_edges = pd.cut(df[column], bins=n_bins, retbins=True)
 
-    return df, {"changed_columns": [new_col], "summary": f"binned {column!r} into {n_bins} bins ({strategy})"}
+    bin_edges_list = [float(e) for e in bin_edges]
+    state: dict[str, Any] = {"column": column, "bin_edges": bin_edges_list, "new_col": new_col}
+    df_out = _apply_bin_numeric(state, df)
+
+    transformer = Transformer(
+        operation="bin_numeric",
+        args={"column": column, "n_bins": n_bins, "strategy": strategy},
+        state=state,
+        apply=functools.partial(_apply_bin_numeric, state),
+    )
+    return df_out, transformer, {
+        "changed_columns": [new_col],
+        "summary": f"binned {column!r} into bins ({strategy}); new_col={new_col!r}",
+    }
 
 
 def interaction(
@@ -118,7 +226,7 @@ def interaction(
     target: str,
     cols: list[str],
     op: str = "mul",
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
     if len(cols) != 2:
         raise ValueError("cols must have exactly 2 elements")
     a, b = cols
@@ -127,23 +235,23 @@ def interaction(
             raise ValueError(f"column not found: {c!r}")
         if not pd.api.types.is_numeric_dtype(df[c]):
             raise ValueError(f"column {c!r} is not numeric")
-
     if op not in ("mul", "div", "add", "sub"):
         raise ValueError(f"op must be one of mul/div/add/sub, got {op!r}")
 
-    df = df.copy()
     new_col = f"{a}__{op}__{b}"
+    state: dict[str, Any] = {"cols": [a, b], "op": op, "new_col": new_col}
+    df_out = _apply_interaction(state, df)
 
-    if op == "mul":
-        df[new_col] = df[a] * df[b]
-    elif op == "div":
-        df[new_col] = df[a] / df[b].replace(0, float("nan"))
-    elif op == "add":
-        df[new_col] = df[a] + df[b]
-    else:
-        df[new_col] = df[a] - df[b]
-
-    return df, {"changed_columns": [new_col], "summary": f"created interaction {new_col!r}"}
+    transformer = Transformer(
+        operation="interaction",
+        args={"cols": cols, "op": op},
+        state=state,
+        apply=functools.partial(_apply_interaction, state),
+    )
+    return df_out, transformer, {
+        "changed_columns": [new_col],
+        "summary": f"created interaction {new_col!r}",
+    }
 
 
 def group_aggregate(
@@ -152,16 +260,44 @@ def group_aggregate(
     by: str,
     value: str,
     agg: str = "mean",
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    for col in (by, value):
-        if col not in df.columns:
-            raise ValueError(f"column not found: {col!r}")
+) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    if by not in df.columns:
+        raise ValueError(f"column not found: {by!r}")
+    if value not in df.columns:
+        raise ValueError(f"column not found: {value!r}")
     if agg not in ("mean", "median", "std", "count"):
         raise ValueError(f"agg must be one of mean/median/std/count, got {agg!r}")
 
-    df = df.copy()
     new_col = f"{value}__{agg}_by_{by}"
-    mapping = df.groupby(by, dropna=False)[value].agg(agg)
-    df[new_col] = df[by].map(mapping)
+    mapping_series = df.groupby(by, dropna=False)[value].agg(agg)
+    mapping = {k: float(v) for k, v in mapping_series.items()}
 
-    return df, {"changed_columns": [new_col], "summary": f"group-aggregated {value!r} by {by!r} ({agg}) -> {new_col!r}"}
+    # compute overall default (used as fallback for unseen groups)
+    if agg == "mean":
+        default = float(df[value].mean())
+    elif agg == "median":
+        default = float(df[value].median())
+    elif agg == "std":
+        default = float(df[value].std())
+    else:  # count
+        default = float(df[value].count())
+
+    state: dict[str, Any] = {
+        "by": by,
+        "value": value,
+        "new_col": new_col,
+        "mapping": mapping,
+        "default": default,
+    }
+    df_out = _apply_group_aggregate(state, df)
+
+    transformer = Transformer(
+        operation="group_aggregate",
+        args={"by": by, "value": value, "agg": agg},
+        state=state,
+        apply=functools.partial(_apply_group_aggregate, state),
+    )
+    return df_out, transformer, {
+        "changed_columns": [new_col],
+        "summary": f"group-aggregated {value!r} by {by!r} ({agg}) -> {new_col!r}",
+    }

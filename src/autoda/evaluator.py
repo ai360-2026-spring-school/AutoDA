@@ -111,10 +111,13 @@ class CatBoostEvaluator:
         if cat_features is None:
             cat_features = [c for c in X.columns if pd.api.types.is_object_dtype(X[c]) or hasattr(X[c].dtype, "categories")]
 
+        _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss"}
+        cb_metric = _metric_map.get(self.metric_name, self.metric_name)
+
         if self.task in ("binary", "multiclass"):
             loss = "Logloss" if self.task == "binary" else "MultiClass"
             model_cls = CatBoostClassifier
-            extra = dict(loss_function=loss, eval_metric=self.metric_name if self.task == "binary" else "Accuracy")
+            extra = dict(loss_function=loss, eval_metric=cb_metric if self.task == "binary" else "Accuracy")
         else:
             model_cls = CatBoostRegressor
             extra = dict(loss_function="RMSE", eval_metric=self.metric_name.upper())
@@ -127,8 +130,12 @@ class CatBoostEvaluator:
         scores: list[float] = []
         last_importances: dict[str, float] | None = None
 
-        X_reset = X.reset_index(drop=True)
+        X_reset = X.reset_index(drop=True).copy()
         y_reset = y.reset_index(drop=True)
+
+        # CatBoost rejects NaN in categorical columns — fill with empty string
+        if cat_features:
+            X_reset[cat_features] = X_reset[cat_features].fillna("").astype(str)
 
         for train_idx, val_idx in splitter.split(X_reset, y_reset):
             X_tr, X_val = X_reset.iloc[train_idx], X_reset.iloc[val_idx]
