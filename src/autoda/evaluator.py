@@ -55,7 +55,7 @@ def _detect_task(y: pd.Series) -> Literal["binary", "multiclass", "regression"]:
     dtype = y.dtype
     n_unique = y.nunique(dropna=True)
 
-    if dtype == bool or (pd.api.types.is_integer_dtype(dtype) and n_unique == 2):
+    if isinstance(dtype, bool) or (pd.api.types.is_integer_dtype(dtype) and n_unique == 2):
         return "binary"
     if (pd.api.types.is_integer_dtype(dtype) or pd.api.types.is_object_dtype(dtype) or hasattr(dtype, "categories")) and 2 < n_unique <= 50:
         return "multiclass"
