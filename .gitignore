@@ -1,0 +1,58 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# virtualenv
+.venv/
+venv/
+env/
+ENV/
+
+# build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# type checkers / linters
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# notebooks
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# local data / artifacts
+data/
+artifacts/
+outputs/
+reports/
+*.log
+
+# optional: generated model/data files
+*.pkl
+*.joblib
+*.parquet
+*.feather
