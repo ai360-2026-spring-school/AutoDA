@@ -18,6 +18,7 @@ class DatasetContext:
     working_test_df: pd.DataFrame | None = field(default=None, init=False)
     working_transformer: "Transformer | None" = field(default=None, init=False)
     fitted_transformers: "list[Transformer]" = field(default_factory=list, init=False)
+    working_transformers_this_iteration: "list[Transformer]" = field(default_factory=list, init=False)
     test_id_values: "pd.Series | None" = field(default=None, init=False)
     test_id_column_name: "str | None" = field(default=None, init=False)
 

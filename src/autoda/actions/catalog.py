@@ -94,7 +94,10 @@ def _parse_docstring(fn: Callable[..., Any]) -> dict[str, Any]:
 
 
 # Args that the framework injects automatically; never advertised to the LLM.
-_FRAMEWORK_ONLY_ARGS = {"df", "target", "feature_importances", "task"}
+_FRAMEWORK_ONLY_ARGS = {
+    "df", "target", "feature_importances", "task",
+    "target_correlation_stats", "long_description_summary",
+}
 
 
 def _signature_args(fn: Callable[..., Any]) -> list[dict[str, Any]]:
@@ -148,6 +151,36 @@ def build_catalog(
     for name, fn in info_tools.items():
         cat.append(describe_action(fn, operation=name, kind="info"))
     return cat
+
+
+def format_catalog_compact(catalog: list[dict[str, Any]]) -> str:
+    """One-line signature per action: op(arg: type=default, ...)
+
+    Used in the planner prompt to keep token cost low while giving the LLM
+    the exact argument names it needs to form valid calls.
+    """
+    transformers = [e for e in catalog if e.get("kind") == "transformer"]
+    info = [e for e in catalog if e.get("kind") == "info"]
+
+    def _sig(entry: dict[str, Any]) -> str:
+        op = entry["operation"]
+        parts: list[str] = []
+        for a in entry.get("args", []):
+            p = a["name"]
+            t = a.get("type")
+            if t:
+                p += f": {t}"
+            if not a.get("required"):
+                dv = a.get("default")
+                p += f"={dv!r}"
+            parts.append(p)
+        return f"  {op}({', '.join(parts)})"
+
+    lines = ["TRANSFORMERS (type=transform):"]
+    lines.extend(_sig(e) for e in transformers)
+    lines.append("INFO TOOLS (type=read_info):")
+    lines.extend(_sig(e) for e in info)
+    return "\n".join(lines)
 
 
 def format_catalog(catalog: list[dict[str, Any]]) -> str:

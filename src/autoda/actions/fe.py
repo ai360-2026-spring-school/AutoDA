@@ -23,6 +23,8 @@ def _apply_expand_datetime(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFr
         df[f"{col}__year"] = dt.dt.year
     if "month" in parts:
         df[f"{col}__month"] = dt.dt.month
+    if "day" in parts:
+        df[f"{col}__day"] = dt.dt.day
     if "dow" in parts:
         df[f"{col}__dow"] = dt.dt.dayofweek
     if "hour" in parts:
@@ -118,7 +120,7 @@ def expand_datetime(
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
 
-    valid_parts = {"year", "month", "dow", "hour", "is_weekend"}
+    valid_parts = {"year", "month", "day", "dow", "hour", "is_weekend"}
     parts = parts or list(valid_parts)
     invalid = set(parts) - valid_parts
     if invalid:
@@ -314,28 +316,26 @@ def group_aggregate(
     Args:
         by: str. Grouping column.
         value: str. Numeric column to aggregate.
-        agg: str. One of "mean", "median", "std", "count". (default: "mean")
+        agg: str. One of "mean", "median", "std", "count", "min", "max". (default: "mean")
     """
     if by not in df.columns:
         raise ValueError(f"column not found: {by!r}")
     if value not in df.columns:
         raise ValueError(f"column not found: {value!r}")
-    if agg not in ("mean", "median", "std", "count"):
-        raise ValueError(f"agg must be one of mean/median/std/count, got {agg!r}")
+    if agg not in ("mean", "median", "std", "count", "min", "max"):
+        raise ValueError(f"agg must be one of mean/median/std/count/min/max, got {agg!r}")
 
     new_col = f"{value}__{agg}_by_{by}"
     mapping_series = df.groupby(by, dropna=False)[value].agg(agg)
     mapping = {k: float(v) for k, v in mapping_series.items()}
 
     # compute overall default (used as fallback for unseen groups)
-    if agg == "mean":
-        default = float(df[value].mean())
-    elif agg == "median":
-        default = float(df[value].median())
-    elif agg == "std":
-        default = float(df[value].std())
-    else:  # count
-        default = float(df[value].count())
+    defaults = {
+        "mean": df[value].mean, "median": df[value].median,
+        "std": df[value].std, "count": df[value].count,
+        "min": df[value].min, "max": df[value].max,
+    }
+    default = float(defaults[agg]())
 
     state: dict[str, Any] = {
         "by": by,
