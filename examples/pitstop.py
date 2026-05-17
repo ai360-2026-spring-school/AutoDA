@@ -35,7 +35,7 @@ res = agent.run(
     description=description,
 )
 
-print(f"baseline {res.baseline_cv:.4 -> final {res.final_cv:.4f}")
+print(f"baseline {res.baseline_cv:.4 -> final {res.final_cv:.4f}}")
 print(f"applied pipeline: {len(res.applied_pipeline)} steps")
 print(f"info-tool calls: {len(res.info_tool_results)}")
 if res.final_test_df is not None:
