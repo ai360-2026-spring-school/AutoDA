@@ -23,6 +23,14 @@ def drop_constant(
     df: pd.DataFrame,
     target: str,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Drop every column with a single unique value (incl. all-NaN).
+
+    Use when: profile_summary lists constant_columns / all_nan_columns. Safe baseline cleanup.
+    Effect: those columns disappear from train and test. Cheap and almost always a CV-neutral or slight win.
+
+    Args:
+        (no args)
+    """
     constant_cols = [
         col for col in df.columns
         if col != target and df[col].nunique(dropna=False) <= 1
@@ -46,6 +54,14 @@ def drop_high_corr(
     target: str,
     threshold: float = 0.98,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Drop near-duplicate numeric features by pairwise correlation.
+
+    Use when: profile_summary lists high_correlation_pairs and the model is wasting splits on redundant columns.
+    Effect: from each correlated pair (|r| > threshold), one column is dropped. Same drop list applied to test.
+
+    Args:
+        threshold: float. Absolute correlation above which a column is considered redundant. (default: 0.98)
+    """
     numeric = df.select_dtypes(include="number").drop(columns=[target], errors="ignore")
     corr = numeric.corr().abs()
 
@@ -77,6 +93,15 @@ def drop_low_importance(
     min_importance: float | None = None,
     feature_importances: dict[str, float] | None = None,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Drop features with low CatBoost feature_importance from the last CV.
+
+    Use when: a previous CV run produced importances and you suspect dead weight columns are hurting splits / generalisation.
+    Effect: keeps only the top features by the last CV's importance scores. Same drop list applied to test.
+
+    Args:
+        top_k_keep: int | None. Keep only the top-K features by importance. Mutually exclusive with min_importance.
+        min_importance: float | None. Keep only features whose importance >= this. Mutually exclusive with top_k_keep.
+    """
     if feature_importances is None:
         raise ValueError("feature_importances must be provided by apply_node from the last CatBoost run")
     if top_k_keep is None and min_importance is None:

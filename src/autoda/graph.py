@@ -11,7 +11,10 @@ from .state import AgentState, Iteration
 from .dataset import DatasetContext
 from .evaluator import CatBoostEvaluator, is_keep, CVResult
 from .profiler import profile_dataset
+from .profile_summary import build_profile_summary
+from .experiment_log import make_experiment_entry as _make_experiment_entry
 from .actions.registry import REGISTRY, SCHEMA, kind_of
+from .experiment_log import args_signature as _args_sig
 from .prompts import (
     build_planner_prompt,
     build_reflect_prompt,
@@ -36,6 +39,17 @@ def _signed_delta(new: CVResult, base: CVResult) -> float:
     if new.metric_direction == "max":
         return new.mean - base.mean
     return base.mean - new.mean
+
+
+def _find_duplicate(action: dict, exp_log: list) -> dict | None:
+    """Return the experiment_log entry if (operation, args) was already kept/rejected."""
+    op = action.get("operation", "")
+    sig = _args_sig(action.get("args", {}))
+    for e in exp_log:
+        if e.get("operation") == op and e.get("args_signature") == sig:
+            if e.get("decision") in ("keep", "reject"):
+                return e
+    return None
 
 
 def build_graph(
@@ -66,6 +80,9 @@ def build_graph(
             dataset_profile = profile_dataframe(context.current_df)
             dataset_profile["profile_error"] = str(e)
 
+        # v4: compact profile summary used by every prompt
+        profile_summary = build_profile_summary(context.current_df, target, dataset_profile)
+
         # baseline CV
         X = context.current_df.drop(columns=[target])
         y = context.current_df[target]
@@ -91,6 +108,7 @@ def build_graph(
 
         return {
             "dataset_profile": dataset_profile,
+            "profile_summary": profile_summary,
             "task": evaluator.task,
             "metric_name": evaluator.metric_name,
             "metric_direction": evaluator.metric_direction,
@@ -103,6 +121,7 @@ def build_graph(
             "applied_actions": [],
             "applied_pipeline": [],
             "info_tool_results": [],
+            "experiment_log": [],
             "decision": "continue",
             "last_error": None,
             "final_report": None,
@@ -263,18 +282,37 @@ def build_graph(
         if state.get("proposed_action", {}) and state["proposed_action"].get("stop"):
             return {"decision": "finish", "proposed_action": None}
 
-        prompt = build_planner_prompt(state, SCHEMA, tolerance=tolerance)
-        response = model.invoke(prompt)
-        content = getattr(response, "content", str(response))
-        action = parse_json_response(content)
+        exp_log = state.get("experiment_log", [])
+        dupe_warning = ""
+        action: dict[str, Any] = {}
+        for attempt in range(3):
+            prompt = build_planner_prompt(state, SCHEMA, tolerance=tolerance)
+            if dupe_warning:
+                prompt = dupe_warning + "\n\n" + prompt
+            response = model.invoke(prompt)
+            content = getattr(response, "content", str(response))
+            action = parse_json_response(content)
 
-        if "error" in action:
-            return {"last_error": action["error"], "proposed_action": None}
+            if "error" in action:
+                return {"last_error": action["error"], "proposed_action": None}
+            if action.get("stop"):
+                return {"decision": "finish", "proposed_action": action, "last_error": None}
 
-        if action.get("stop"):
-            return {"decision": "finish", "proposed_action": action, "last_error": None}
+            dupe = _find_duplicate(action, exp_log)
+            if dupe is None:
+                return {"proposed_action": action, "last_error": None}
 
-        return {"proposed_action": action, "last_error": None}
+            dupe_warning = (
+                f"HARD REJECTION (attempt {attempt + 1}): you proposed "
+                f"{action.get('operation')}({action.get('args')}) which was already "
+                f"{dupe['decision'].upper()} at step {dupe['step']}. "
+                "You MUST propose a genuinely different operation or meaningfully different args."
+            )
+
+        return {
+            "last_error": f"Planner proposed duplicate 3 times: {action.get('operation')}",
+            "proposed_action": None,
+        }
 
     def apply_node(state: AgentState) -> dict[str, Any]:
         action = state.get("proposed_action")
@@ -481,10 +519,21 @@ def build_graph(
                 updates["applied_actions"] = [action]
 
                 # re-profile on keep
+                refreshed_profile = None
                 try:
                     html_path = reports_dir / f"profile_step_{step}.html"
-                    new_profile = profile_dataset(context.current_df, state["target"], html_path=html_path)
-                    updates["dataset_profile"] = new_profile
+                    refreshed_profile = profile_dataset(
+                        context.current_df, state["target"], html_path=html_path
+                    )
+                    updates["dataset_profile"] = refreshed_profile
+                except Exception:
+                    refreshed_profile = state.get("dataset_profile")
+
+                # rebuild compact summary against the new df
+                try:
+                    updates["profile_summary"] = build_profile_summary(
+                        context.current_df, state["target"], refreshed_profile or {}
+                    )
                 except Exception:
                     pass
 
@@ -497,6 +546,21 @@ def build_graph(
         if new_insight:
             updates.setdefault("insights", [])
             updates["insights"] = updates.get("insights", []) + [new_insight]
+
+        # v4: always record this attempt in the experiment log so the planner
+        # next turn knows what's been tried (and won't propose duplicates).
+        updates["experiment_log"] = [
+            _make_experiment_entry(
+                step=step,
+                operation=op,
+                kind=op_kind,
+                args=action.get("args", {}),
+                decision=iter_decision,
+                cv_delta=cv_delta,
+                obs=obs,
+                error=error,
+            )
+        ]
 
         # stop conditions
         stop = step >= max_iterations or bool(action.get("stop"))
@@ -556,6 +620,10 @@ def build_graph(
         X_train = context.current_df.drop(columns=[target], errors="ignore")
         y_train = context.current_df[target]
         X_test = context.current_test_df
+
+        # id was extracted from test_df in runner.py but may still be in train
+        if context.test_id_column_name and context.test_id_column_name in X_train.columns:
+            X_train = X_train.drop(columns=[context.test_id_column_name])
 
         train_cols = set(X_train.columns)
         test_cols = set(X_test.columns)

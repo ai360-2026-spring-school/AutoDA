@@ -51,14 +51,60 @@ def is_keep(new: CVResult, base: CVResult | None, tol: float = TOLERANCE) -> boo
     return (base.mean - new.mean) > tol
 
 
-def _detect_task(y: pd.Series) -> Literal["binary", "multiclass", "regression"]:
-    dtype = y.dtype
-    n_unique = y.nunique(dropna=True)
+def _detect_task(
+    y: pd.Series,
+    *,
+    multiclass_max_unique: int = 50,
+    discrete_float_max_unique: int = 20,
+) -> Literal["binary", "multiclass", "regression"]:
+    """Auto-detect ML task from a target column.
 
-    if isinstance(dtype, bool) or (pd.api.types.is_integer_dtype(dtype) and n_unique == 2):
+    Cardinality-first, dtype second. Handles the common bug where a
+    classification target is stored as float (e.g. ``0.0`` / ``1.0``).
+
+    Rules (in order):
+      * dropna'd values; if fewer than 2 unique → caller's problem, treated as binary.
+      * ``n_unique == 2`` → ``binary`` (regardless of dtype, incl. float / object).
+      * boolean dtype → ``binary``.
+      * float dtype: if all non-NaN values are integer-valued AND
+        ``n_unique <= discrete_float_max_unique`` → ``multiclass``;
+        otherwise → ``regression``.
+      * integer / object / category dtype: ``2 < n_unique <= multiclass_max_unique`` → ``multiclass``;
+        otherwise → ``regression`` (rare for object dtype, but possible if it's a numeric
+        column stored as strings — caller should cast first).
+    """
+    y_clean = y.dropna()
+    n_unique = y_clean.nunique()
+    dtype = y.dtype
+
+    if n_unique <= 1:
+        return "binary"  # degenerate; let CatBoost surface the error downstream
+
+    if n_unique == 2:
         return "binary"
-    if (pd.api.types.is_integer_dtype(dtype) or pd.api.types.is_object_dtype(dtype) or hasattr(dtype, "categories")) and 2 < n_unique <= 50:
-        return "multiclass"
+
+    if pd.api.types.is_bool_dtype(dtype):
+        return "binary"
+
+    if pd.api.types.is_float_dtype(dtype):
+        # Check if all values are effectively integers (e.g., 0.0, 1.0, 2.0)
+        try:
+            is_int_valued = bool((y_clean == y_clean.round()).all())
+        except (TypeError, ValueError):
+            is_int_valued = False
+        if is_int_valued and n_unique <= discrete_float_max_unique:
+            return "multiclass"
+        return "regression"
+
+    if (
+        pd.api.types.is_integer_dtype(dtype)
+        or pd.api.types.is_object_dtype(dtype)
+        or isinstance(dtype, pd.CategoricalDtype)
+    ):
+        if n_unique <= multiclass_max_unique:
+            return "multiclass"
+        return "regression"
+
     return "regression"
 
 
@@ -83,7 +129,7 @@ class CatBoostEvaluator:
         self.n_splits = n_splits
         self.history_path = history_path
         self.metric_direction: Literal["max", "min"] = _default_metric(task)[1]
-        if metric_name in ("roc_auc",):
+        if metric_name in ("roc_auc", "f1"):
             self.metric_direction = "max"
         elif metric_name in ("mlogloss", "rmse", "mae", "mse"):
             self.metric_direction = "min"
@@ -123,7 +169,7 @@ class CatBoostEvaluator:
         if cat_features is None:
             cat_features = self._detect_cat_features(X)
 
-        _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss"}
+        _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss", "f1": "F1"}
         cb_metric = _metric_map.get(self.metric_name, self.metric_name)
 
         if self.task in ("binary", "multiclass"):
@@ -158,13 +204,23 @@ class CatBoostEvaluator:
             )
 
             if self.task == "binary":
-                from sklearn.metrics import roc_auc_score
-                preds = model.predict_proba(X_val)[:, 1]
-                score = float(roc_auc_score(y_val, preds))
+                if self.metric_name == "f1":
+                    from sklearn.metrics import f1_score
+                    preds = model.predict(X_val)
+                    score = float(f1_score(y_val, preds, average="binary"))
+                else:
+                    from sklearn.metrics import roc_auc_score
+                    preds = model.predict_proba(X_val)[:, 1]
+                    score = float(roc_auc_score(y_val, preds))
             elif self.task == "multiclass":
-                from sklearn.metrics import log_loss
-                preds = model.predict_proba(X_val)
-                score = float(log_loss(y_val, preds))
+                if self.metric_name == "f1":
+                    from sklearn.metrics import f1_score
+                    preds = model.predict(X_val)
+                    score = float(f1_score(y_val, preds, average="weighted"))
+                else:
+                    from sklearn.metrics import log_loss
+                    preds = model.predict_proba(X_val)
+                    score = float(log_loss(y_val, preds))
             else:
                 from sklearn.metrics import mean_squared_error
                 preds = model.predict(X_val)
@@ -197,7 +253,7 @@ class CatBoostEvaluator:
         X = self._prepare_X(X, cat_features)
         y = y.reset_index(drop=True)
 
-        _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss"}
+        _metric_map = {"roc_auc": "AUC", "mlogloss": "MultiLogloss", "f1": "F1"}
         cb_metric = _metric_map.get(self.metric_name, self.metric_name)
 
         full_params = dict(COMMON_PARAMS)

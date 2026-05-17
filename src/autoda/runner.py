@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,52 @@ from .prompts import (
 
 def sanitize_target(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "target"
+
+
+def resolve_model_label(provider: str, model_name: str | None) -> str:
+    """Pick the user-facing model label used in the reports subfolder.
+
+    Resolution order:
+      1. explicit ``model_name`` kwarg on PDAgent.
+      2. provider-specific env var (TIMEWEB_MODEL / GIGACHAT_MODEL).
+      3. provider-specific fallback ("timeweb-agent" / "GigaChat-2-Max").
+    """
+    if model_name:
+        return model_name
+    if provider == "timeweb":
+        return os.getenv("TIMEWEB_MODEL", "timeweb-agent")
+    if provider == "gigachat":
+        return os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max")
+    return f"{provider}-unknown"
+
+
+def _coerce_description(description: Any) -> str | None:
+    """Accept str | Path | list[str] | None. Returns a single trimmed string or None.
+
+    Lists are joined with blank lines so multi-paragraph inputs keep
+    paragraph boundaries. A string that names an existing file is read.
+    Anything else is converted with ``str()``.
+    """
+    if description is None:
+        return None
+    if isinstance(description, Path):
+        return description.read_text().strip() or None
+    if isinstance(description, str):
+        try:
+            if Path(description).exists():
+                return Path(description).read_text().strip() or None
+        except (OSError, ValueError):
+            pass
+        return description.strip() or None
+    if isinstance(description, (list, tuple)):
+        parts: list[str] = []
+        for item in description:
+            if item is None:
+                continue
+            parts.append(str(item).strip())
+        text = "\n\n".join(p for p in parts if p)
+        return text or None
+    return str(description).strip() or None
 
 
 @dataclass
@@ -78,8 +125,11 @@ class PDAgent:
         id_column: str | None = None,
     ) -> AgentResult:
         dataset_id = str(uuid.uuid4())
-        reports_dir = Path(reports_dir)
-        reports_dir = reports_dir / sanitize_target(target)
+
+        # subfolder = <target>__<model_label> so runs across models live side-by-side
+        model_label = resolve_model_label(self.provider, self.model_name)
+        subfolder_name = f"{sanitize_target(target)}__{sanitize_target(model_label)}"
+        reports_dir = Path(reports_dir) / subfolder_name
         reports_dir.mkdir(parents=True, exist_ok=True)
 
         # Build LLM once — may be needed early for description summarisation
@@ -90,23 +140,15 @@ class PDAgent:
             max_tokens=self.max_tokens,
         )
 
-        # --- T16: resolve dataset description ---
+        # --- T16+T23: resolve dataset description (accept str | Path | list[str] | None) ---
         resolved_description: str | None = None
-        if description is not None:
-            # check if it's a path
-            if isinstance(description, Path) or (
-                isinstance(description, str) and Path(description).exists()
-            ):
-                raw_text = Path(description).read_text()
-            else:
-                raw_text = str(description)
-            raw_text = raw_text.strip()
-            if raw_text:
-                (reports_dir / "dataset_description.txt").write_text(raw_text)
-                if len(raw_text) > DESCRIPTION_TOKEN_BUDGET:
-                    raw_text = summarize_description(llm, raw_text)
-                    (reports_dir / "dataset_description.summary.txt").write_text(raw_text)
-                resolved_description = raw_text
+        raw_text = _coerce_description(description)
+        if raw_text:
+            (reports_dir / "dataset_description.txt").write_text(raw_text)
+            if len(raw_text) > DESCRIPTION_TOKEN_BUDGET:
+                raw_text = summarize_description(llm, raw_text)
+                (reports_dir / "dataset_description.summary.txt").write_text(raw_text)
+            resolved_description = raw_text
 
         # --- T19: handle id column before constructing DatasetContext ---
         test_id_values: pd.Series | None = None

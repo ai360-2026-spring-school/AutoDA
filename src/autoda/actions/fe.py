@@ -106,6 +106,15 @@ def expand_datetime(
     column: str,
     parts: list[str] | None = None,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Extract components from a datetime column into separate numeric features.
+
+    Use when: profile_summary lists the column under datetime_columns and the timestamp likely carries seasonal signal.
+    Effect: adds columns like <col>__year, <col>__month, <col>__dow, etc.; original column is kept.
+
+    Args:
+        column: str. Datetime-typed (or coercible) column.
+        parts: list[str] | None. Subset of {"year", "month", "dow", "hour", "is_weekend"}. (default: all of them)
+    """
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
 
@@ -136,6 +145,14 @@ def binarize_missing(
     target: str,
     columns: list[str],
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Add a 0/1 indicator column for each input column's missingness pattern.
+
+    Use when: missingness itself is informative (e.g. "no Cabin" predicts Survival).
+    Effect: adds <col>__isna columns of 0/1; original column is untouched.
+
+    Args:
+        columns: list[str]. Columns to add missing-indicators for.
+    """
     state: dict[str, Any] = {"columns": columns}
     df_out = _apply_binarize_missing(state, df)
     added = [f"{c}__isna" for c in columns if c in df.columns]
@@ -158,6 +175,15 @@ def log_transform(
     columns: list[str],
     plus_one: bool = True,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Apply natural log to numeric columns to reduce heavy right-skew.
+
+    Use when: a numeric column appears in high_skew_columns (|skew|>1) and all values are non-negative.
+    Effect: each column is replaced with log(x) or log(x+1).
+
+    Args:
+        columns: list[str]. Numeric columns to log-transform.
+        plus_one: bool. Use log(x+1) so zeros are safe. Disable only when you know x>0 strictly. (default: True)
+    """
     valid_cols = []
     for col in columns:
         if col not in df.columns:
@@ -190,6 +216,16 @@ def bin_numeric(
     n_bins: int = 5,
     strategy: str = "quantile",
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Discretise a numeric column into bin indices.
+
+    Use when: the column has a non-linear effect that tree splits aren't capturing, or it should be treated as categorical.
+    Effect: adds <col>__bin column with integer bin indices; original column kept.
+
+    Args:
+        column: str. Numeric column to bin.
+        n_bins: int. Number of bins. (default: 5)
+        strategy: str. "quantile" (equal frequency) or "uniform" (equal width). (default: "quantile")
+    """
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
     if column == target:
@@ -227,6 +263,15 @@ def interaction(
     cols: list[str],
     op: str = "mul",
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Create a single pairwise interaction feature between two numeric columns.
+
+    Use when: domain reason or insight ledger suggests a product/ratio carries signal CatBoost won't trivially derive.
+    Effect: adds <a>__<op>__<b> column.
+
+    Args:
+        cols: list[str]. Exactly two numeric columns [a, b].
+        op: str. One of "mul", "div", "add", "sub". (default: "mul")
+    """
     if len(cols) != 2:
         raise ValueError("cols must have exactly 2 elements")
     a, b = cols
@@ -261,6 +306,16 @@ def group_aggregate(
     value: str,
     agg: str = "mean",
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Add a group-level statistic of `value` joined back per row by `by`.
+
+    Use when: a categorical column has meaningful group statistics (e.g. mean fare per port).
+    Effect: adds <value>__<agg>_by_<by>; mapping is fit on train and re-used on test (unseen keys → train-wide aggregate).
+
+    Args:
+        by: str. Grouping column.
+        value: str. Numeric column to aggregate.
+        agg: str. One of "mean", "median", "std", "count". (default: "mean")
+    """
     if by not in df.columns:
         raise ValueError(f"column not found: {by!r}")
     if value not in df.columns:

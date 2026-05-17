@@ -79,6 +79,16 @@ def impute_missing(
     strategy: str = "mean",
     fill_value: Any = None,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Fill NaNs in numeric / categorical columns with a learned fill value.
+
+    Use when: profile_summary shows columns with non-zero missing_rate AND those columns look useful (don't bother imputing if you're about to drop).
+    Effect: each column's NaNs become the train-fit fill (mean/median/mode/constant/knn). Same fill is re-applied to the test set.
+
+    Args:
+        columns: list[str]. Columns to impute. The target is silently skipped.
+        strategy: str. One of "mean", "median", "mode", "constant", "knn". (default: "mean")
+        fill_value: Any. Required only for strategy="constant".
+    """
     valid = {"mean", "median", "mode", "constant", "knn"}
     if strategy not in valid:
         raise ValueError(f"strategy must be one of {valid}, got {strategy!r}")
@@ -134,6 +144,14 @@ def drop_columns(
     target: str,
     columns: list[str],
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Drop one or more feature columns.
+
+    Use when: profile_summary lists them as constant, all-NaN, near-unique (likely an id), or suspected leakage; or feature importance is ~0.
+    Effect: those columns disappear from train and test. Target column is silently protected.
+
+    Args:
+        columns: list[str]. Column names to drop. Missing names are silently skipped.
+    """
     safe_columns = [c for c in columns if c != target and c in df.columns]
     df_out = df.drop(columns=safe_columns)
     state: dict[str, Any] = {"columns": safe_columns}
@@ -154,6 +172,14 @@ def drop_duplicates(
     target: str,
     subset: list[str] | None = None,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Remove duplicate rows from the training set only (identity on test).
+
+    Use when: profile suggests many exact-duplicate rows that would bias CV.
+    Effect: train shrinks; test/submission rows are NEVER dropped.
+
+    Args:
+        subset: list[str] | None. Subset of columns to consider for the duplicate check. (default: None — all columns)
+    """
     before = len(df)
     df_out = df.drop_duplicates(subset=subset)
     removed = before - len(df_out)
@@ -178,6 +204,17 @@ def clip_outliers(
     lower: float | None = None,
     upper: float | None = None,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Cap extreme values in numeric columns.
+
+    Use when: a numeric column has a few huge / tiny values that destabilise CV (see high_skew_columns in profile_summary).
+    Effect: values are clamped to learned [lo, hi] bounds; same bounds re-applied to test.
+
+    Args:
+        columns: list[str]. Numeric columns to clip. Non-numeric / target are silently skipped.
+        method: str. "iqr" uses Q1−1.5·IQR / Q3+1.5·IQR; "quantile" uses the lower/upper kwargs as quantile fractions. (default: "iqr")
+        lower: float | None. Lower quantile for method="quantile". (default: 0.01)
+        upper: float | None. Upper quantile for method="quantile". (default: 0.99)
+    """
     if method not in ("iqr", "quantile"):
         raise ValueError(f"method must be 'iqr' or 'quantile', got {method!r}")
 
@@ -221,6 +258,16 @@ def collapse_rare_categories(
     min_freq: int | float = 50,
     other_label: str = "OTHER",
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Replace rare category values in one column with a single bucket label.
+
+    Use when: a categorical column has many low-frequency values (long tail) that produce noisy splits.
+    Effect: values seen fewer than min_freq times become other_label; the same rare set is applied on test.
+
+    Args:
+        column: str. The categorical column to collapse.
+        min_freq: int | float<1. Absolute count threshold (int) OR fraction of rows (float < 1). (default: 50)
+        other_label: str. Label to use for the collapsed bucket. (default: "OTHER")
+    """
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
     if column == target:
@@ -256,6 +303,15 @@ def cast_dtype(
     column: str,
     dtype: str,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Cast one column to a different dtype.
+
+    Use when: a column is stored as the wrong type (e.g. numeric stored as object, or a date stored as string).
+    Effect: column dtype changes on train and test.
+
+    Args:
+        column: str. Column to cast.
+        dtype: str. One of "int", "float", "category", "datetime".
+    """
     if column not in df.columns:
         raise ValueError(f"column not found: {column!r}")
     if column == target:

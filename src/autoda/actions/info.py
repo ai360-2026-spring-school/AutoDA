@@ -12,7 +12,15 @@ def sparse_linear_features(
     alpha: float | None = None,
     task: str,
 ) -> dict[str, Any]:
-    """Read-only probe. Returns top sparse-linear features."""
+    """Info-tool: fit a sparse linear model (Lasso / L1-LogReg) and return the top features.
+
+    Use when: you want to know which numeric features carry linear signal before committing to a transformer.
+    Effect: NO change to the dataframe and NO CV. The result is stored as an insight for use on later turns.
+
+    Args:
+        n_keep: int. How many top features (by |coef|) to return. (default: 15)
+        alpha: float | None. Regularisation strength. None means CV-pick. (default: None)
+    """
     try:
         from sklearn.linear_model import LassoCV, Lasso, LogisticRegressionCV
         from sklearn.preprocessing import StandardScaler
@@ -87,7 +95,14 @@ def baseline_linear_model(
     *,
     task: str,
 ) -> dict[str, Any]:
-    """Read-only probe. Fits a simple linear model with 5-fold CV."""
+    """Info-tool: fit a default LinearRegression / LogisticRegression and report 5-fold CV.
+
+    Use when: you want a quick reference score for what a linear model gets, so you know whether non-linear FE has headroom over the current CatBoost CV.
+    Effect: NO change to the dataframe and NO CatBoost CV. Result is stored as an insight.
+
+    Args:
+        (no args)
+    """
     try:
         from sklearn.linear_model import LinearRegression, LogisticRegression
         from sklearn.preprocessing import StandardScaler

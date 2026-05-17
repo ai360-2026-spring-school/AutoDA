@@ -50,3 +50,12 @@ class AgentState(TypedDict):
     final_report: str | None
     dataset_description: str | None
     submission_path: str | None
+
+    # v4: compact, structured signal derived from dataset_profile; injected
+    # into planner and reflect prompts every turn (much cheaper than the raw
+    # profile JSON). Re-built when current_df changes on a keep.
+    profile_summary: dict[str, Any]
+
+    # v4: deduped history of every action the planner has tried so far,
+    # appended in reflect_node so the planner can see "don't repeat this".
+    experiment_log: Annotated[list[dict[str, Any]], operator.add]

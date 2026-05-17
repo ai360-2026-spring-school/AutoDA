@@ -86,6 +86,14 @@ def frequency_encode(
     target: str,
     columns: list[str],
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Replace each categorical value with its train-set frequency.
+
+    Use when: a high-cardinality categorical can't be one-hot encoded but its value frequency carries signal.
+    Effect: column dtype becomes float; unseen test values map to 0.
+
+    Args:
+        columns: list[str]. Categorical columns to encode.
+    """
     freq_maps: dict[str, dict] = {}
     for col in columns:
         if col not in df.columns:
@@ -116,6 +124,15 @@ def target_encode_oof(
     columns: list[str],
     smoothing: float = 10.0,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Leakage-safe target-mean encoding for high-cardinality categoricals.
+
+    Use when: a categorical column has too many levels for one-hot AND frequency encoding underperforms; target encoding usually wins on Kaggle-style data.
+    Effect: train output is computed OOF (no leakage); the stored encoding map uses the full train and is reapplied verbatim to test.
+
+    Args:
+        columns: list[str]. Categorical columns to encode.
+        smoothing: float. Bayesian smoothing toward the global mean — bigger = more conservative. (default: 10.0)
+    """
     if target not in df.columns:
         raise ValueError(f"target column not found: {target!r}")
     if not pd.api.types.is_numeric_dtype(df[target]):
@@ -185,6 +202,15 @@ def one_hot(
     columns: list[str],
     max_cardinality: int = 20,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """One-hot encode low-cardinality categoricals.
+
+    Use when: a categorical column has at most ~20 levels AND CatBoost cannot natively handle it (or you want explicit columns for stacking).
+    Effect: each value becomes its own 0/1 column. Test set is encoded with the *train* categories (unseen values map to zeros across all dummies).
+
+    Args:
+        columns: list[str]. Categorical columns to encode.
+        max_cardinality: int. Refuse if any column has more unique values than this. (default: 20)
+    """
     for col in columns:
         if col not in df.columns:
             raise ValueError(f"column not found: {col!r}")
@@ -231,6 +257,14 @@ def standard_scale(
     target: str,
     columns: list[str],
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Standardise numeric columns to mean 0, std 1 using train statistics.
+
+    Use when: you're using sparse_linear_features / baseline_linear_model or stacking with a linear model. CatBoost itself doesn't need scaling.
+    Effect: column becomes (x − train_mean) / train_std; identical mean/std re-applied to test.
+
+    Args:
+        columns: list[str]. Numeric columns to scale.
+    """
     scale_params: dict[str, dict[str, float]] = {}
     for col in columns:
         if col not in df.columns:
@@ -261,6 +295,14 @@ def min_max_scale(
     target: str,
     columns: list[str],
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
+    """Rescale numeric columns to [0, 1] using train min/max.
+
+    Use when: a downstream linear/NN model needs bounded inputs.
+    Effect: column becomes (x − train_min) / (train_max − train_min); same bounds applied to test (test values may fall outside [0,1] if extrapolating).
+
+    Args:
+        columns: list[str]. Numeric columns to scale.
+    """
     scale_params: dict[str, dict[str, float]] = {}
     for col in columns:
         if col not in df.columns:
