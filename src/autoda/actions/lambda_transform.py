@@ -118,6 +118,12 @@ def multi_col_lambda(
                 "input_columns not provided and could not be auto-detected from expression. "
                 "Please specify input_columns explicitly."
             )
+    # Guard against target leakage — target must never be an input feature
+    if target in input_columns:
+        raise ValueError(
+            f"Target leakage: '{target}' cannot be used as input_column. "
+            "Derived features using the target cause data leakage."
+        )
     missing = [c for c in input_columns if c not in df.columns]
     if missing:
         raise ValueError(f"input_columns not found in dataframe: {missing}")

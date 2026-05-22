@@ -338,6 +338,8 @@ def interaction(
     op = _OP_ALIASES.get(op.lower(), op)
     if op not in _VALID_OPS:
         raise ValueError(f"op must be one of {'/'.join(_VALID_OPS)}, got {op!r}")
+    if target in (a, b):
+        raise ValueError(f"Target leakage: '{target}' cannot be used in interaction.")
 
     new_col = f"{a}__{op}__{b}"
     state: dict[str, Any] = {"cols": [a, b], "op": op, "new_col": new_col}
@@ -456,6 +458,8 @@ def group_aggregate(
         raise ValueError(f"column not found: {by!r}")
     if value not in df.columns:
         raise ValueError(f"column not found: {value!r}")
+    if by == target or value == target:
+        raise ValueError(f"Target leakage: '{target}' cannot be used in group_aggregate.")
     # Normalize common aliases
     _agg_aliases = {"average": "mean", "avg": "mean", "stddev": "std", "variance": "std",
                     "cnt": "count", "n": "count", "minimum": "min", "maximum": "max"}
