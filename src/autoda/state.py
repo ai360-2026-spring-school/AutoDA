@@ -3,59 +3,54 @@ from typing_extensions import Annotated
 import operator
 
 
-class Iteration(TypedDict):
-    step: int
-    thought: str
-    action: dict[str, Any]
-    applied: bool
-    observation: dict[str, Any]
-    cv_before: float | None
-    cv_after: float | None
-    cv_delta: float | None
-    cv_std_before: float | None
-    cv_std_after: float | None
-    decision: Literal["keep", "reject", "error"]
-    conclusion: str
-    insight: dict[str, Any] | None
-
-
 class AgentState(TypedDict):
+    # --- Task metadata ---
     goal: str
     target: str
     task: Literal["binary", "multiclass", "regression"]
     metric_name: str
     metric_direction: Literal["max", "min"]
-
     dataset_id: str
-    dataset_profile: dict[str, Any]
 
+    # --- Baseline CV (set in preprocess_node) ---
     baseline_cv_mean: float | None
     baseline_cv_std: float | None
 
     has_test_df: bool
 
-    iterations: Annotated[list[Iteration], operator.add]
+    # --- Loop control ---
     current_step: int
-
-    proposed_action: dict[str, Any] | None
-    last_observation: dict[str, Any] | None
-    last_error: str | None
-
-    insights: Annotated[list[dict[str, Any]], operator.add]
-    applied_actions: Annotated[list[dict[str, Any]], operator.add]
-    applied_pipeline: Annotated[list[dict[str, Any]], operator.add]
-    info_tool_results: Annotated[list[dict[str, Any]], operator.add]
-
     decision: Literal["continue", "finish"]
     final_report: str | None
-    dataset_description: str | None
     submission_path: str | None
 
-    # v4: compact, structured signal derived from dataset_profile; injected
-    # into planner and reflect prompts every turn (much cheaper than the raw
-    # profile JSON). Re-built when current_df changes on a keep.
-    profile_summary: dict[str, Any]
-
-    # v4: deduped history of every action the planner has tried so far,
-    # appended in reflect_node so the planner can see "don't repeat this".
+    # --- Accumulator fields (append-only via operator.add) ---
     experiment_log: Annotated[list[dict[str, Any]], operator.add]
+    applied_pipeline: Annotated[list[dict[str, Any]], operator.add]
+
+    # --- Preprocessing outputs (set once in preprocess_node) ---
+    column_type_map: dict[str, Literal["NUMERIC", "CATEGORICAL"]]
+    target_correlation_stats: dict[str, Any]
+    feature_columns: list[str]
+
+    # --- Description summaries (set once in summarise_node) ---
+    dataset_description: str | None
+    long_description_summary: str | None   # ~1000 chars, for critic
+    short_description_summary: str | None  # ~300 chars, for planner
+
+    # --- Planner memory (replace-semantics, not operator.add) ---
+    planner_memory: list[str]
+
+    # --- Critic output ---
+    critic_message: str | None
+
+    # --- Intra-iteration tracking ---
+    current_iteration_transforms: list[dict[str, Any]]
+    iteration_start_cv: float | None
+
+    # --- Planner turn control ---
+    planner_addendum: dict[str, Any] | None
+    planner_turn_count: int
+
+    # --- Ideator suggestions (replace-semantics, refreshed each iteration) ---
+    ideator_suggestions: list[dict[str, Any]]

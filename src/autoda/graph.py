@@ -1,55 +1,85 @@
 from __future__ import annotations
 
-import datetime as _dt
 import json
+import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal
 
+import pandas as pd
 from langgraph.graph import StateGraph, START, END
 
-from .state import AgentState, Iteration
+from .state import AgentState
 from .dataset import DatasetContext
 from .evaluator import CatBoostEvaluator, is_keep, CVResult
-from .profiler import profile_dataset
-from .profile_summary import build_profile_summary
-from .experiment_log import make_experiment_entry as _make_experiment_entry
-from .actions.registry import REGISTRY, SCHEMA, kind_of
-from .experiment_log import args_signature as _args_sig
-from .prompts import (
-    build_planner_prompt,
-    build_reflect_prompt,
-    build_final_report_prompt,
-    build_analyze_prompt
+from .preprocessor import run_preprocess
+from .column_typer import detect_column_types
+from .actions.registry import TRANSFORMERS
+from .actions.info import sparse_linear_features, baseline_linear_model
+from .actions.info_new import (
+    groupby_agg, value_counts, correlation_matrix,
+    describe_column, view_precomputed_stats, view_long_summary,
 )
+from .prompts import (
+    build_description_summarise_prompt,
+    build_planner_prompt,
+    build_critic_prompt,
+    build_final_report_prompt,
+    build_ideator_prompt,
+    IDEATOR_ROLES,
+)
+
+_INFO_TOOLS_NEW = {
+    "groupby_agg": groupby_agg,
+    "value_counts": value_counts,
+    "correlation_matrix": correlation_matrix,
+    "describe_column": describe_column,
+    "view_precomputed_stats": view_precomputed_stats,
+    "view_long_summary": view_long_summary,
+}
+_INFO_TOOLS_OLD = {
+    "sparse_linear_features": sparse_linear_features,
+    "baseline_linear_model": baseline_linear_model,
+}
+_ALL_INFO_TOOLS = {**_INFO_TOOLS_NEW, **_INFO_TOOLS_OLD}
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
     text = text.strip()
-    # strip markdown code fences if present
+    # Strip markdown code fences
     if text.startswith("```"):
         lines = text.splitlines()
         text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    text = text.strip()
+    # Fast path: valid JSON
     try:
         return json.loads(text)
-    except json.JSONDecodeError as e:
-        return {"error": f"Could not parse JSON: {e}", "raw": text}
+    except json.JSONDecodeError:
+        pass
+    # Handle "Extra data" — model returned JSON + trailing explanation text.
+    # raw_decode stops at the end of the first complete JSON value.
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # Last resort: find the first {...} block in the text
+    start = text.find("{")
+    if start != -1:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text[start:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return {"_parse_error": f"Could not parse JSON from response", "_raw": text[:300]}
 
 
 def _signed_delta(new: CVResult, base: CVResult) -> float:
     if new.metric_direction == "max":
         return new.mean - base.mean
     return base.mean - new.mean
-
-
-def _find_duplicate(action: dict, exp_log: list) -> dict | None:
-    """Return the experiment_log entry if (operation, args) was already kept/rejected."""
-    op = action.get("operation", "")
-    sig = _args_sig(action.get("args", {}))
-    for e in exp_log:
-        if e.get("operation") == op and e.get("args_signature") == sig:
-            if e.get("decision") in ("keep", "reject"):
-                return e
-    return None
 
 
 def build_graph(
@@ -60,543 +90,622 @@ def build_graph(
     max_iterations: int = 20,
     tolerance: float = 1e-4,
     reports_dir: Path = Path("reports"),
+    ohe_max_cardinality: int = 12,
+    numeric_unique_threshold: int = 12,
+    oversample: bool = True,
+    max_inner_turns: int = 15,
+    debug: bool = False,
+    critic_every: int = 3,
+    critic_model=None,
+    n_ideators: int = 0,
+    ideator_model=None,
 ):
     reports_dir = Path(reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    # baseline result stored as mutable cell so reflect_node can update it
     baseline_cell: list[CVResult | None] = [None]
 
-    def profile_node(state: AgentState) -> dict[str, Any]:
+    def _dbg(*parts: Any) -> None:
+        if debug:
+            print(" ".join(str(p) for p in parts), flush=True)
+
+    def _args_brief(args: dict) -> str:
+        s = json.dumps(args, ensure_ascii=False)
+        return s[:70] + "..." if len(s) > 70 else s
+
+    # -----------------------------------------------------------------------
+    # Phase 1: Deterministic preprocessing
+    # -----------------------------------------------------------------------
+
+    def preprocess_node(state: AgentState) -> dict[str, Any]:
         target = state["target"]
+        task = evaluator.task
 
-        # profile
-        html_path = reports_dir / "profile_initial.html"
-        try:
-            dataset_profile = profile_dataset(context.current_df, target, html_path=html_path)
-        except Exception as e:
-            # ydata-profiling may not be installed in test envs
-            from .dataset import profile_dataframe
-            dataset_profile = profile_dataframe(context.current_df)
-            dataset_profile["profile_error"] = str(e)
+        _dbg(f"[preprocess] {task}, {len(context.df)} rows x {len(context.df.columns)} cols — running...")
 
-        # v4: compact profile summary used by every prompt
-        profile_summary = build_profile_summary(context.current_df, target, dataset_profile)
+        df_out, transformers, col_type_map, corr_stats = run_preprocess(
+            df=context.df,
+            target=target,
+            task=task,
+            ohe_max_cardinality=ohe_max_cardinality,
+            numeric_unique_threshold=numeric_unique_threshold,
+            oversample=oversample,
+        )
 
-        # baseline CV
-        X = context.current_df.drop(columns=[target])
+        context.current_df = df_out
+        context.fitted_transformers = list(transformers)
+
+        # Apply preprocessing to test_df (upsampling excluded — no transformer)
+        if context.test_df is not None:
+            test_out = context.test_df.copy()
+            for t in transformers:
+                try:
+                    test_out = t.apply(test_out)
+                except Exception:
+                    pass
+            context.current_test_df = test_out
+
+        # Baseline CV on preprocessed data
+        X = context.current_df.drop(columns=[target], errors="ignore")
         y = context.current_df[target]
         baseline = evaluator.cv(X, y, step=0)
         baseline_cell[0] = baseline
 
-        # synthetic iteration-0 record
-        baseline_iter: Iteration = {
-            "step": 0,
-            "thought": "baseline",
-            "action": {"operation": "baseline"},
-            "applied": True,
-            "observation": {"summary": "initial CatBoost CV"},
-            "cv_before": None,
-            "cv_after": baseline.mean,
-            "cv_delta": None,
-            "cv_std_before": None,
-            "cv_std_after": baseline.std,
-            "decision": "keep",
-            "conclusion": f"Baseline {evaluator.metric_name}={baseline.mean:.4f} ± {baseline.std:.4f}",
-            "insight": None,
-        }
+        feature_cols = [c for c in context.current_df.columns if c != target]
+        initial_memory: list[str] = []
+
+        _dbg(
+            f"[preprocess] {task},"
+            f" {len(context.df)}→{len(df_out)} rows,"
+            f" {len(context.df.columns)}→{len(df_out.columns)} cols,"
+            f" baseline {evaluator.metric_name}={baseline.mean:.4f} ± {baseline.std:.4f}"
+        )
 
         return {
-            "dataset_profile": dataset_profile,
-            "profile_summary": profile_summary,
-            "task": evaluator.task,
+            "task": task,
             "metric_name": evaluator.metric_name,
             "metric_direction": evaluator.metric_direction,
             "baseline_cv_mean": baseline.mean,
             "baseline_cv_std": baseline.std,
             "has_test_df": context.test_df is not None,
+            "column_type_map": col_type_map,
+            "target_correlation_stats": corr_stats,
+            "feature_columns": feature_cols,
+            "iteration_start_cv": baseline.mean,
             "current_step": 0,
-            "iterations": [baseline_iter],
-            "insights": [],
-            "applied_actions": [],
-            "applied_pipeline": [],
-            "info_tool_results": [],
             "experiment_log": [],
+            "applied_pipeline": [],
             "decision": "continue",
-            "last_error": None,
             "final_report": None,
-            "proposed_action": None,
-            "last_observation": None,
+            "submission_path": None,
+            "planner_memory": initial_memory,
+            "critic_message": None,
+            "current_iteration_transforms": [],
+            "planner_addendum": None,
+            "planner_turn_count": 0,
+            "long_description_summary": None,
+            "short_description_summary": None,
         }
 
-    def analyze_node(state: AgentState) -> dict[str, Any]:
-        """Deterministic + LLM analysis of the initial profile."""
-        profile = state.get("dataset_profile", {})
-        columns = profile.get("columns", [])
-        target = state["target"]
-        task = state["task"]
-        insights: list[dict[str, Any]] = []
+    # -----------------------------------------------------------------------
+    # Phase 2: Description summarisation (LLM, once)
+    # -----------------------------------------------------------------------
 
-        # --- deterministic insights ---
-        # Columns with >50% missing
-        high_missing = [
-            c["name"] for c in columns
-            if c["name"] != target and c.get("missing_rate", 0) > 0.5
-        ]
-        if high_missing:
-            insights.append({
-                "title": "High missingness columns",
-                "body": f"Columns with >50% missing values: {high_missing}. Consider imputing or dropping.",
-                "evidence": {"columns": high_missing},
-                "source": "deterministic",
-            })
-
-        # Suspected leakage: unique_rate > 0.9 and not target
-        n_rows = profile.get("shape", [0])[0] or 1
-        leakage_candidates = []
-        for c in columns:
-            if c["name"] == target:
-                continue
-            unique_rate = c.get("n_unique", 0) / n_rows
-            if unique_rate > 0.9:
-                leakage_candidates.append(c["name"])
-        if leakage_candidates:
-            insights.append({
-                "title": "Potential leakage columns (high unique rate)",
-                "body": f"Columns with unique_rate > 0.9 (not target): {leakage_candidates}. May be IDs or timestamps.",
-                "evidence": {"columns": leakage_candidates},
-                "source": "deterministic",
-            })
-
-        # High cardinality categorical cols (n_unique > 20, non-numeric)
-        high_card_cats = [
-            c["name"] for c in columns
-            if c["name"] != target
-            and c.get("n_unique", 0) > 20
-            and "int" not in c.get("dtype", "")
-            and "float" not in c.get("dtype", "")
-        ]
-        if high_card_cats:
-            insights.append({
-                "title": "High-cardinality categorical columns",
-                "body": f"Categorical cols with >20 unique values: {high_card_cats}. Use frequency or target encoding.",
-                "evidence": {"columns": high_card_cats},
-                "source": "deterministic",
-            })
-
-        # Datetime-typed columns
-        datetime_cols = [
-            c["name"] for c in columns
-            if "datetime" in c.get("dtype", "") or "date" in c.get("dtype", "").lower()
-        ]
-        if datetime_cols:
-            insights.append({
-                "title": "Datetime columns detected",
-                "body": f"Datetime columns: {datetime_cols}. Consider expand_datetime to extract year/month/dow/hour/is_weekend.",
-                "evidence": {"columns": datetime_cols},
-                "source": "deterministic",
-            })
-
-        # Class imbalance for binary tasks
-        if task == "binary":
-            target_col_info = next((c for c in columns if c["name"] == target), None)
-            if target_col_info and "top_values" in target_col_info:
-                top_vals = target_col_info["top_values"]
-                if top_vals:
-                    total = sum(top_vals.values())
-                    minority_frac = min(top_vals.values()) / total if total > 0 else 0.5
-                    if minority_frac < 0.3:
-                        insights.append({
-                            "title": "Class imbalance detected",
-                            "body": f"Minority class fraction: {minority_frac:.2%}. Consider class-weight strategies.",
-                            "evidence": {"minority_fraction": minority_frac, "distribution": top_vals},
-                            "source": "deterministic",
-                        })
-
-        # Strong correlations between numeric features (detected from profile stats)
-        # We can't compute full corr matrix here, but we note columns with similar stats
-        numeric_cols = [c for c in columns if "stats" in c and c["name"] != target]
-        if len(numeric_cols) >= 2:
-            insights.append({
-                "title": "Numeric features available",
-                "body": f"{len(numeric_cols)} numeric features found. Consider drop_high_corr to remove redundant features.",
-                "evidence": {"count": len(numeric_cols)},
-                "source": "deterministic",
-            })
-
-        # --- LLM insights ---
-        n_llm_insights = 0
-        parse_ok = True
-        analyze_prompt = build_analyze_prompt(state)
-        prompt_chars = len(analyze_prompt)
-        response_chars = 0
-        try:
-            response = model.invoke(analyze_prompt)
-            content = getattr(response, "content", str(response))
-            response_chars = len(content)
-            parsed = parse_json_response(content)
-            if "error" in parsed:
-                parse_ok = False
-                insights.append({
-                    "title": "analyze_node JSON parse failure",
-                    "body": parsed["error"],
-                    "evidence": {"raw_excerpt": parsed.get("raw", "")[:500]},
-                    "source": "analyze_llm_error",
-                })
-            else:
-                llm_insights = parsed.get("insights", [])
-                if isinstance(llm_insights, list):
-                    for ins in llm_insights:
-                        if isinstance(ins, dict):
-                            ins.setdefault("source", "llm")
-                            insights.append(ins)
-                    n_llm_insights = len(llm_insights)
-        except Exception as exc:
-            parse_ok = False
-            insights.append({
-                "title": "analyze_node exception",
-                "body": repr(exc),
-                "evidence": {},
-                "source": "analyze_llm_error",
-            })
-
-        # write debug log
-        try:
-            log_path = reports_dir / "analyze_debug.log"
-            log_entry = json.dumps({
-                "timestamp": _dt.datetime.utcnow().isoformat(),
-                "prompt_chars": prompt_chars,
-                "response_chars": response_chars,
-                "parse_ok": parse_ok,
-                "n_deterministic_insights": len([i for i in insights if i.get("source") in ("deterministic",)]),
-                "n_llm_insights": n_llm_insights,
-            })
-            with log_path.open("a") as lf:
-                lf.write(log_entry + "\n")
-        except Exception:
-            pass
-
-        return {"insights": insights, "has_test_df": context.test_df is not None}
-
-    def planner_node(state: AgentState) -> dict[str, Any]:
-        if state.get("proposed_action", {}) and state["proposed_action"].get("stop"):
-            return {"decision": "finish", "proposed_action": None}
-
-        exp_log = state.get("experiment_log", [])
-        dupe_warning = ""
-        action: dict[str, Any] = {}
-        for attempt in range(3):
-            prompt = build_planner_prompt(state, SCHEMA, tolerance=tolerance)
-            if dupe_warning:
-                prompt = dupe_warning + "\n\n" + prompt
-            response = model.invoke(prompt)
-            content = getattr(response, "content", str(response))
-            action = parse_json_response(content)
-
-            if "error" in action:
-                return {"last_error": action["error"], "proposed_action": None}
-            if action.get("stop"):
-                return {"decision": "finish", "proposed_action": action, "last_error": None}
-
-            dupe = _find_duplicate(action, exp_log)
-            if dupe is None:
-                return {"proposed_action": action, "last_error": None}
-
-            dupe_warning = (
-                f"HARD REJECTION (attempt {attempt + 1}): you proposed "
-                f"{action.get('operation')}({action.get('args')}) which was already "
-                f"{dupe['decision'].upper()} at step {dupe['step']}. "
-                "You MUST propose a genuinely different operation or meaningfully different args."
-            )
-
-        return {
-            "last_error": f"Planner proposed duplicate 3 times: {action.get('operation')}",
-            "proposed_action": None,
-        }
-
-    def apply_node(state: AgentState) -> dict[str, Any]:
-        action = state.get("proposed_action")
-
-        if not action:
-            return {"last_observation": None, "last_error": "no proposed action"}
-
-        if action.get("stop"):
-            return {"last_observation": None, "last_error": None}
-
-        op = action.get("operation")
-        args = action.get("args", {})
-
-        if op not in REGISTRY:
-            return {
-                "last_observation": None,
-                "last_error": f"unknown operation: {op!r}",
-            }
-
-        # determine kind, defaulting to transformer on error
-        try:
-            op_kind = kind_of(op)
-        except KeyError:
-            op_kind = "transformer"
-
-        if op_kind == "info":
-            # info tools: call with task kwarg, return observation dict directly
-            try:
-                obs = REGISTRY[op](context.current_df, state["target"], task=state["task"], **args)
-                return {"last_observation": obs, "last_error": None}
-            except Exception as e:
-                return {"last_observation": None, "last_error": repr(e)}
-        else:
-            # transformer: inject feature_importances for drop_low_importance
-            if op == "drop_low_importance":
-                args = dict(args, feature_importances=evaluator.last_feature_importances_)
-
-            try:
-                df_new, transformer, observation = REGISTRY[op](context.current_df, state["target"], **args)
-                context.working_df = df_new
-                context.working_transformer = transformer
-
-                # sync test df
-                if context.current_test_df is not None:
-                    try:
-                        context.working_test_df = transformer.apply(context.current_test_df)
-                    except Exception as e:
-                        context.working_test_df = None
-                        observation = dict(observation)
-                        observation["test_apply_error"] = repr(e)
-
-                return {"last_observation": observation, "last_error": None}
-            except Exception as e:
-                context.working_df = None
-                context.working_transformer = None
-                context.working_test_df = None
-                return {"last_observation": None, "last_error": repr(e)}
-
-    def evaluate_node(state: AgentState) -> dict[str, Any]:
-        # pass-through on error or when apply didn't produce a df
-        if state.get("last_error") or context.working_df is None:
+    def summarise_node(state: AgentState) -> dict[str, Any]:
+        description = state.get("dataset_description")
+        if not description:
+            _dbg("[summarise] skipped (no description)")
             return {}
 
-        op = (state.get("proposed_action") or {}).get("operation", "")
-
-        # info operations don't change the df — skip CV
+        prompt = build_description_summarise_prompt(description)
         try:
-            if kind_of(op) == "info":
-                return {}
-        except KeyError:
-            pass  # unknown op — fall through to CV
-
-        target = state["target"]
-        X = context.working_df.drop(columns=[target], errors="ignore")
-        y = context.working_df[target]
-
-        try:
-            result = evaluator.cv(X, y, step=state.get("current_step", 0) + 1)
-        except Exception as e:
-            return {"last_error": repr(e)}
-
-        # store temporarily in observation so reflect_node can read it
-        obs = dict(state.get("last_observation") or {})
-        obs["_cv_result"] = result.as_dict()
-        return {"last_observation": obs}
-
-    def reflect_node(state: AgentState) -> dict[str, Any]:
-        base = baseline_cell[0]
-        action = state.get("proposed_action") or {}
-        op = action.get("operation", "")
-        error = state.get("last_error")
-        obs = state.get("last_observation") or {}
-        step = state.get("current_step", 0) + 1
-
-        # determine operation kind
-        try:
-            op_kind = kind_of(op)
-        except KeyError:
-            op_kind = "transformer"
-
-        obs = dict(obs)  # make mutable
-        cv_result_dict = obs.pop("_cv_result", None)
-        cv_after_result: CVResult | None = None
-        if cv_result_dict:
-            cv_after_result = CVResult(**cv_result_dict)
-
-        cv_before = base.mean if base else None
-        cv_std_before = base.std if base else None
-        cv_after = cv_after_result.mean if cv_after_result else None
-        cv_std_after = cv_after_result.std if cv_after_result else None
-
-        # determine iteration decision
-        if error:
-            iter_decision = "error"
-            cv_delta = None
-        elif op_kind == "info":
-            # info ops are always "keep" (or error if obs has "error")
-            if obs.get("error"):
-                iter_decision = "error"
-            else:
-                iter_decision = "keep"
-            cv_delta = None
-        elif cv_after_result and base:
-            kept = is_keep(cv_after_result, base, tol=tolerance)
-            iter_decision = "keep" if kept else "reject"
-            cv_delta = _signed_delta(cv_after_result, base)
-        else:
-            iter_decision = "error"
-            cv_delta = None
-
-        # LLM reflection
-        reflect_prompt = build_reflect_prompt(
-            state,
-            cv_before=cv_before,
-            cv_after=cv_after,
-            cv_delta=cv_delta,
-            decision=iter_decision,
-        )
-        try:
-            response = model.invoke(reflect_prompt)
+            response = model.invoke(prompt)
             content = getattr(response, "content", str(response))
-            reflection = parse_json_response(content)
+            parsed = parse_json_response(content)
+            if "_parse_error" in parsed:
+                _dbg("[summarise] parse error, skipped")
+                return {}
+            long_summary = parsed.get("long_summary", "")[:400]
+            short_summary = parsed.get("short_summary", "")[:300]
         except Exception:
-            reflection = {}
+            _dbg("[summarise] exception, skipped")
+            return {}
 
-        conclusion = reflection.get("conclusion", "")
-        new_insight = reflection.get("insight")
+        _dbg("[summarise] summaries generated")
+        initial_memory = [short_summary] if short_summary else []
+        return {
+            "long_description_summary": long_summary,
+            "short_description_summary": short_summary,
+            "planner_memory": initial_memory,
+        }
 
-        iteration: Iteration = {
+    # -----------------------------------------------------------------------
+    # Phase 2b: Ideator node (runs once per iteration before planner turn 1)
+    # -----------------------------------------------------------------------
+
+    _ideator_model = ideator_model if ideator_model is not None else model
+    _ideator_roles = IDEATOR_ROLES[:n_ideators] if n_ideators > 0 else []
+
+    def _call_one_ideator(role: dict[str, str], state: AgentState) -> dict[str, Any] | None:
+        """Call model with one ideator role. Returns suggestion dict or None on failure."""
+        try:
+            prompt = build_ideator_prompt(state, role["instruction"])
+            response = _ideator_model.invoke(prompt)
+            content = getattr(response, "content", None) or ""
+            parsed = parse_json_response(content)
+            if "_parse_error" in parsed:
+                return None
+            suggestion = parsed.get("suggestion", "").strip()
+            if not suggestion:
+                return None
+            return {
+                "role": role["name"],
+                "suggestion": suggestion,
+                "rationale": parsed.get("rationale", "")[:200],
+                "priority": parsed.get("priority", "medium"),
+            }
+        except Exception:
+            return None
+
+    def ideate_node(state: AgentState) -> dict[str, Any]:
+        if not _ideator_roles:
+            return {"ideator_suggestions": []}
+
+        suggestions: list[dict[str, Any]] = []
+
+        # Call all ideators in parallel
+        with ThreadPoolExecutor(max_workers=len(_ideator_roles)) as pool:
+            futures = {
+                pool.submit(_call_one_ideator, role, state): role["name"]
+                for role in _ideator_roles
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    suggestions.append(result)
+
+        # Sort by priority: high → medium → low
+        _priority_order = {"high": 0, "medium": 1, "low": 2}
+        suggestions.sort(key=lambda s: _priority_order.get(s.get("priority", "medium"), 1))
+
+        step = state.get("current_step", 0) + 1
+        if suggestions:
+            for s in suggestions:
+                _dbg(f"[ideate/{s['role']}:{s['priority']}] {s['suggestion'][:80]}")
+        else:
+            _dbg(f"[ideate] step {step}: no suggestions (all failed or empty)")
+
+        return {"ideator_suggestions": suggestions}
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Planner node (self-loop)
+    # -----------------------------------------------------------------------
+
+    def _call_info_tool(op: str, args: dict, state: AgentState, df: pd.DataFrame) -> dict:
+        target = state["target"]
+        injected: dict[str, Any] = {}
+        if op in ("sparse_linear_features", "baseline_linear_model"):
+            injected["task"] = state.get("task", "regression")
+        elif op == "view_precomputed_stats":
+            injected["target_correlation_stats"] = state.get("target_correlation_stats", {})
+        elif op == "view_long_summary":
+            injected["long_description_summary"] = state.get("long_description_summary")
+
+        combined = {**injected, **args}
+        try:
+            if op in _ALL_INFO_TOOLS:
+                return _ALL_INFO_TOOLS[op](df, target, **combined)
+            return {"error": f"Unknown info tool: {op!r}"}
+        except Exception as e:
+            return {"error": repr(e)}
+
+    def _apply_transformer(op: str, args: dict, state: AgentState) -> tuple[Any, Any, Any, str | None]:
+        """Apply a transformer op. Returns (df_out, test_df_out, transformer, error)."""
+        target = state["target"]
+
+        if op not in TRANSFORMERS:
+            return None, None, None, f"Unknown transformer: {op!r}"
+
+        # Inject feature importances for drop_low_importance
+        call_args = dict(args)
+        if op == "drop_low_importance":
+            call_args.setdefault("feature_importances", evaluator.last_feature_importances_)
+
+        working_df = context.working_df
+        if working_df is None:
+            working_df = context.current_df.copy()
+
+        try:
+            df_out, transformer, observation = TRANSFORMERS[op](working_df, target, **call_args)
+        except Exception as e:
+            return None, None, None, repr(e)
+
+        # Apply to test_df
+        test_df_out = None
+        if context.working_test_df is not None or context.current_test_df is not None:
+            test_src = context.working_test_df if context.working_test_df is not None else context.current_test_df
+            try:
+                test_df_out = transformer.apply(test_src)
+            except Exception as te:
+                # test apply failed — observation carries warning but transform still applies on train
+                observation = dict(observation)
+                observation["test_apply_warning"] = repr(te)
+
+        return df_out, test_df_out, transformer, None
+
+    def planner_node(state: AgentState) -> dict[str, Any]:
+        # Lazily initialize working_df at the start of each iteration
+        if context.working_df is None:
+            context.working_df = context.current_df.copy()
+            context.working_transformers_this_iteration = []
+            if context.current_test_df is not None:
+                context.working_test_df = context.current_test_df.copy()
+
+        turn_count = state.get("planner_turn_count", 0)
+        _step = state.get("current_step", 0) + 1
+        _tag = f"[step {_step} / turn {turn_count + 1}]"
+
+        # Force submit if inner turn limit reached
+        if turn_count >= max_inner_turns:
+            _dbg(f"{_tag} submit (forced — turn limit {max_inner_turns} reached)")
+            return {
+                "planner_addendum": {
+                    "submit": True,
+                    "rationale": f"принудительная отправка (лимит {max_inner_turns} ходов)",
+                },
+            }
+
+        # Build prompt and call LLM (retry up to 2 times on network errors)
+        prompt = build_planner_prompt(state)
+        text = None
+        llm_error: str | None = None
+        for _attempt in range(3):
+            try:
+                response = model.invoke(prompt)
+                text = getattr(response, "content", None) or ""
+                llm_error = None
+                break
+            except Exception as e:
+                llm_error = repr(e)
+                _dbg(f"{_tag} LLM attempt {_attempt + 1}/3 failed: {e}")
+
+        if llm_error is not None:
+            _dbg(f"{_tag} LLM call failed after retries")
+            return {
+                "planner_addendum": {"parse_error": f"LLM call failed: {llm_error}"},
+                "planner_turn_count": turn_count + 1,
+            }
+
+        if not text:
+                # Empty response — usually means the prompt was too long for the model.
+                _dbg(f"{_tag} empty LLM response (prompt too long?) — clearing addendum")
+                return {
+                    "planner_addendum": {
+                        "parse_error": "Пустой ответ от LLM. Промпт мог быть слишком длинным. "
+                                       "Попробуй более короткое действие.",
+                    },
+                    "planner_turn_count": turn_count + 1,
+                }
+
+        action = parse_json_response(text)
+        if "_parse_error" in action:
+            _dbg(f"{_tag} parse_error: {action['_parse_error'][:80]}")
+            return {
+                "planner_addendum": {"parse_error": action["_parse_error"]},
+                "planner_turn_count": turn_count + 1,
+            }
+
+        action_type = action.get("type", "")
+
+        # --- stop ---
+        if action_type == "stop":
+            _dbg(f"{_tag} stop: {action.get('reason', '')!r}")
+            return {
+                "planner_addendum": {"stop": True},
+                "decision": "finish",
+            }
+
+        # --- submit ---
+        if action_type == "submit":
+            rationale = action.get("rationale", "")
+            _dbg(f"{_tag} submit: {rationale!r}")
+            return {
+                "planner_addendum": {
+                    "submit": True,
+                    "rationale": rationale,
+                },
+            }
+
+        # --- read_info ---
+        if action_type == "read_info":
+            op = action.get("op", "")
+            args = action.get("args", {})
+            result = _call_info_tool(op, args, state, context.working_df)
+            _dbg(f"{_tag} read_info: {op}({_args_brief(args)})")
+            return {
+                "planner_addendum": {"info_result": result, "info_op": op},
+                "planner_turn_count": turn_count + 1,
+            }
+
+        # --- transform ---
+        if action_type == "transform":
+            op = action.get("op", "")
+            args = action.get("args", {})
+            df_out, test_df_out, transformer, error = _apply_transformer(op, args, state)
+
+            if error:
+                _dbg(f"{_tag} transform ERROR: {op}({_args_brief(args)}) → {error[:60]}")
+                return {
+                    "planner_addendum": {
+                        "transform_error": {"op": op, "args": args, "error": error},
+                    },
+                    "planner_turn_count": turn_count + 1,
+                }
+
+            # Commit to working context
+            context.working_df = df_out
+            if test_df_out is not None:
+                context.working_test_df = test_df_out
+            context.working_transformers_this_iteration.append(transformer)
+
+            # Re-detect column types for new/changed columns
+            new_col_map = detect_column_types(df_out, state["target"],
+                                               unique_threshold=numeric_unique_threshold)
+            changed_cols: list[str] = []
+            if hasattr(transformer, "args"):
+                changed_cols = [c for c in df_out.columns if c not in context.current_df.columns]
+                if not changed_cols and op in ("multi_col_lambda",):
+                    result_col = args.get("result_column", "")
+                    if result_col:
+                        changed_cols = [result_col]
+
+            new_types = {c: new_col_map.get(c, "NUMERIC") for c in changed_cols}
+
+            new_iter_transforms = list(state.get("current_iteration_transforms", [])) + [
+                {"op": op, "args": args}
+            ]
+
+            _dbg(f"{_tag} transform: {op}({_args_brief(args)})")
+            return {
+                "planner_addendum": {
+                    "transform_applied": {
+                        "op": op,
+                        "args": args,
+                        "changed_columns": changed_cols,
+                        "new_types": new_types,
+                    },
+                    "all_transforms": new_iter_transforms,
+                },
+                "current_iteration_transforms": new_iter_transforms,
+                "column_type_map": new_col_map,
+                "planner_turn_count": turn_count + 1,
+            }
+
+        # --- update_memory ---
+        if action_type == "update_memory":
+            notes = action.get("notes", [])
+            if isinstance(notes, str):
+                notes = [notes]
+            new_memory = list(state.get("planner_memory", [])) + [str(n) for n in notes]
+            total = sum(len(n) for n in new_memory)
+            while total > 2000 and len(new_memory) > 1:
+                removed = new_memory.pop(0)
+                total -= len(removed)
+            _dbg(f"{_tag} update_memory: {notes[:2]}")
+            return {
+                "planner_memory": new_memory,
+                "planner_addendum": {
+                    "memory_updated": True,
+                    "all_transforms": state.get("current_iteration_transforms", []),
+                },
+                "planner_turn_count": turn_count + 1,
+            }
+
+        # --- cancel ---
+        if action_type == "cancel":
+            n_rolled = len(state.get("current_iteration_transforms", []))
+            context.working_df = context.current_df.copy()
+            if context.current_test_df is not None:
+                context.working_test_df = context.current_test_df.copy()
+            context.working_transformers_this_iteration = []
+            restored_col_map = detect_column_types(
+                context.current_df, state["target"], unique_threshold=numeric_unique_threshold
+            )
+            _dbg(f"{_tag} cancel ({n_rolled} transforms rolled back)")
+            return {
+                "planner_addendum": {"cancelled": True, "rolled_back_n": n_rolled},
+                "current_iteration_transforms": [],
+                "column_type_map": restored_col_map,
+                "planner_turn_count": turn_count + 1,
+            }
+
+        # Unknown action type
+        _dbg(f"{_tag} parse_error: unknown action type {action_type!r}")
+        return {
+            "planner_addendum": {"parse_error": f"Unknown action type: {action_type!r}"},
+            "planner_turn_count": turn_count + 1,
+        }
+
+    # -----------------------------------------------------------------------
+    # Evaluate node
+    # -----------------------------------------------------------------------
+
+    def evaluate_node(state: AgentState) -> dict[str, Any]:
+        target = state["target"]
+        step = state.get("current_step", 0) + 1
+        base = baseline_cell[0]
+
+        working = context.working_df if context.working_df is not None else context.current_df
+        X = working.drop(columns=[target], errors="ignore")
+        y = working[target]
+
+        try:
+            result = evaluator.cv(X, y, step=step)
+        except Exception as e:
+            # CV failed — reject and log error
+            context.working_df = None
+            context.working_test_df = None
+            context.working_transformers_this_iteration = []
+            return {
+                "current_step": step,
+                "current_iteration_transforms": [],
+                "planner_turn_count": 0,
+                "planner_addendum": {
+                    "new_iteration": True,
+                    "step": step + 1,
+                    "cv": base.mean if base else 0.0,
+                    "decision": "error",
+                    "delta": 0.0,
+                },
+                "experiment_log": [{
+                    "step": step,
+                    "transforms": state.get("current_iteration_transforms", []),
+                    "rationale": (state.get("planner_addendum") or {}).get("rationale", ""),
+                    "cv_before": base.mean if base else None,
+                    "cv_after": None,
+                    "delta": 0.0,
+                    "decision": "error",
+                    "error": repr(e),
+                }],
+            }
+
+        rationale = (state.get("planner_addendum") or {}).get("rationale", "")
+        iter_transforms = state.get("current_iteration_transforms", [])
+        cv_before = base.mean if base else 0.0
+        cv_after = result.mean
+        kept = is_keep(result, base, tol=tolerance)
+        delta = _signed_delta(result, base) if base else 0.0
+        decision = "keep" if kept else "reject"
+
+        log_entry = {
             "step": step,
-            "thought": action.get("thought", ""),
-            "action": action,
-            "applied": iter_decision == "keep",
-            "observation": obs,
+            "transforms": iter_transforms,
+            "rationale": rationale,
             "cv_before": cv_before,
             "cv_after": cv_after,
-            "cv_delta": cv_delta,
-            "cv_std_before": cv_std_before,
-            "cv_std_after": cv_std_after,
-            "decision": iter_decision,
-            "conclusion": conclusion,
-            "insight": new_insight,
+            "delta": delta,
+            "decision": decision,
         }
 
         updates: dict[str, Any] = {
-            "iterations": [iteration],
             "current_step": step,
-            "last_error": None,
-            "last_observation": obs,
+            "current_iteration_transforms": [],
+            "planner_turn_count": 0,
+            "experiment_log": [log_entry],
+            "planner_addendum": {
+                "new_iteration": True,
+                "step": step + 1,
+                "cv": cv_after,
+                "decision": decision,
+                "delta": delta,
+            },
+            "iteration_start_cv": cv_after,
         }
 
-        if iter_decision == "keep":
-            if op_kind == "info":
-                # record info tool result as insight
-                info_insight = {
-                    "title": f"{op} result",
-                    "body": obs.get("summary", str(obs)[:200]),
-                    "evidence": obs,
-                    "source": "info_tool",
-                }
-                updates["insights"] = [info_insight]
-                updates["info_tool_results"] = [{"operation": op, "args": action.get("args", {}), "result": obs}]
-            else:
-                # transformer keep
-                context.current_df = context.working_df
-                baseline_cell[0] = cv_after_result
-                updates["baseline_cv_mean"] = cv_after_result.mean
-                updates["baseline_cv_std"] = cv_after_result.std
+        if kept:
+            context.current_df = context.working_df
+            if context.working_test_df is not None:
+                context.current_test_df = context.working_test_df
+            context.fitted_transformers.extend(context.working_transformers_this_iteration)
+            baseline_cell[0] = result
 
-                # append to fitted pipeline
-                context.fitted_transformers.append(context.working_transformer)
-                transformer_id = len(context.fitted_transformers) - 1
-                updates["applied_pipeline"] = [{
-                    "step": step,
-                    "operation": op,
-                    "args": action.get("args", {}),
-                    "transformer_id": transformer_id,
-                }]
-
-                # promote working test df
-                if context.working_test_df is not None:
-                    context.current_test_df = context.working_test_df
-
-                updates["applied_actions"] = [action]
-
-                # re-profile on keep
-                refreshed_profile = None
-                try:
-                    html_path = reports_dir / f"profile_step_{step}.html"
-                    refreshed_profile = profile_dataset(
-                        context.current_df, state["target"], html_path=html_path
-                    )
-                    updates["dataset_profile"] = refreshed_profile
-                except Exception:
-                    refreshed_profile = state.get("dataset_profile")
-
-                # rebuild compact summary against the new df
-                try:
-                    updates["profile_summary"] = build_profile_summary(
-                        context.current_df, state["target"], refreshed_profile or {}
-                    )
-                except Exception:
-                    pass
-
-        else:
-            # reject or error
-            context.working_df = None
-            context.working_transformer = None
-            context.working_test_df = None
-
-        if new_insight:
-            updates.setdefault("insights", [])
-            updates["insights"] = updates.get("insights", []) + [new_insight]
-
-        # v4: always record this attempt in the experiment log so the planner
-        # next turn knows what's been tried (and won't propose duplicates).
-        updates["experiment_log"] = [
-            _make_experiment_entry(
-                step=step,
-                operation=op,
-                kind=op_kind,
-                args=action.get("args", {}),
-                decision=iter_decision,
-                cv_delta=cv_delta,
-                obs=obs,
-                error=error,
+            updates["baseline_cv_mean"] = result.mean
+            updates["baseline_cv_std"] = result.std
+            updates["applied_pipeline"] = [
+                {"step": step, "operation": t.operation, "args": t.args}
+                for t in context.working_transformers_this_iteration
+            ]
+            # Refresh column type map on the new current_df
+            updates["column_type_map"] = detect_column_types(
+                context.current_df, state["target"], unique_threshold=numeric_unique_threshold
             )
-        ]
 
-        # stop conditions
-        stop = step >= max_iterations or bool(action.get("stop"))
-        updates["decision"] = "finish" if stop else "continue"
+        # Reset working context for next iteration
+        context.working_df = None
+        context.working_test_df = None
+        context.working_transformers_this_iteration = []
+
+        # Check stop condition
+        if step >= max_iterations:
+            updates["decision"] = "finish"
 
         return updates
 
+    # -----------------------------------------------------------------------
+    # Critic node
+    # -----------------------------------------------------------------------
+
+    def critic_node(state: AgentState) -> dict[str, Any]:
+        step = state.get("current_step", 0)
+        exp_log = state.get("experiment_log", [])
+
+        if step % critic_every != 0:
+            _dbg(f"[critic] skipped (step {step}, runs every {critic_every})")
+            return {}  # preserve last critic_message
+
+        if len(exp_log) < 2:
+            _dbg("[critic] skipped (< 2 experiments)")
+            return {"critic_message": None}
+
+        prompt = build_critic_prompt(state)
+        _critic = critic_model if critic_model is not None else model
+        try:
+            response = _critic.invoke(prompt)
+            content = getattr(response, "content", str(response))
+            parsed = parse_json_response(content)
+            if "_parse_error" in parsed:
+                _dbg("[critic] parse error")
+                return {"critic_message": None}
+            message = parsed.get("message")
+            if message:
+                _dbg(f"[critic] {message[:120]!r}")
+            else:
+                _dbg("[critic] silent")
+            return {"critic_message": message if message else None}
+        except Exception:
+            _dbg("[critic] exception")
+            return {"critic_message": None}
+
+    # -----------------------------------------------------------------------
+    # Final report node
+    # -----------------------------------------------------------------------
+
     def final_report_node(state: AgentState) -> dict[str, Any]:
-        import pickle as _pickle
-        import json as _json
+        base_cv = state.get("baseline_cv_mean") or 0.0
+        # Find final CV from last kept entry in experiment_log
+        exp_log = state.get("experiment_log", [])
+        kept_entries = [e for e in exp_log if e.get("decision") == "keep"]
+        final_cv = kept_entries[-1]["cv_after"] if kept_entries else base_cv
 
-        prompt = build_final_report_prompt(state)
-        response = model.invoke(prompt)
-        report = getattr(response, "content", str(response))
+        prompt = build_final_report_prompt(state, baseline_cv=base_cv, final_cv=final_cv)
+        try:
+            response = model.invoke(prompt)
+            report = getattr(response, "content", str(response))
+        except Exception as e:
+            report = f"[Report generation failed: {e}]"
 
-        # write artifacts
-        (reports_dir / "final_report.md").write_text(report)
+        # Write artifacts
+        try:
+            (reports_dir / "final_report.md").write_text(report)
+        except Exception:
+            pass
+
         try:
             context.current_df.to_parquet(reports_dir / "final_dataset.parquet", index=False)
         except Exception:
             pass
 
-        # persist fitted pipeline
         try:
             with (reports_dir / "fitted_pipeline.pkl").open("wb") as f:
-                _pickle.dump(context.fitted_transformers, f)
+                pickle.dump(context.fitted_transformers, f)
         except Exception:
             pass
 
         try:
-            (reports_dir / "pipeline.json").write_text(
-                _json.dumps(
-                    [{"operation": t.operation, "args": t.args} for t in context.fitted_transformers],
-                    indent=2,
-                )
-            )
+            (reports_dir / "pipeline.json").write_text(json.dumps(
+                [{"operation": t.operation, "args": t.args} for t in context.fitted_transformers],
+                indent=2,
+            ))
         except Exception:
             pass
 
@@ -608,11 +717,14 @@ def build_graph(
             except Exception:
                 pass
 
+        _dbg(f"[final_report] saved to {reports_dir / 'final_report.md'}")
         return {"final_report": report}
 
-    def submit_node(state: AgentState) -> dict[str, Any]:
-        import pandas as _pd
+    # -----------------------------------------------------------------------
+    # Submit node
+    # -----------------------------------------------------------------------
 
+    def submit_node(state: AgentState) -> dict[str, Any]:
         if context.current_test_df is None:
             return {}
 
@@ -621,7 +733,6 @@ def build_graph(
         y_train = context.current_df[target]
         X_test = context.current_test_df
 
-        # id was extracted from test_df in runner.py but may still be in train
         if context.test_id_column_name and context.test_id_column_name in X_train.columns:
             X_train = X_train.drop(columns=[context.test_id_column_name])
 
@@ -631,12 +742,10 @@ def build_graph(
             missing_in_test = train_cols - test_cols
             extra_in_test = test_cols - train_cols
             raise RuntimeError(
-                f"Feature mismatch between train and test.\n"
-                f"Missing in test: {missing_in_test}\nExtra in test: {extra_in_test}"
+                f"Feature mismatch — missing in test: {missing_in_test}; extra in test: {extra_in_test}"
             )
 
         model_fitted = evaluator.fit_full(X_train, y_train)
-
         cat_features = evaluator._detect_cat_features(X_test)
         X_test_clean = evaluator._prepare_X(X_test, cat_features)
 
@@ -648,51 +757,69 @@ def build_graph(
             preds = model_fitted.predict(X_test_clean)
 
         id_name = context.test_id_column_name or "id"
-        if context.test_id_values is not None:
-            id_vals = context.test_id_values.values
-        else:
-            id_vals = range(len(preds))
+        id_vals = context.test_id_values.values if context.test_id_values is not None else range(len(preds))
 
-        sub = _pd.DataFrame({id_name: id_vals, target: preds})
+        sub = pd.DataFrame({id_name: id_vals, target: preds})
         sub_path = reports_dir / "submission.csv"
         sub.to_csv(sub_path, index=False)
 
+        _dbg(f"[submit] submission saved to {sub_path}")
         return {"submission_path": str(sub_path)}
 
-    def route_after_planner(state: AgentState) -> Literal["apply", "final_report"]:
-        if state.get("decision") == "finish":
-            return "final_report"
-        return "apply"
+    # -----------------------------------------------------------------------
+    # Routing
+    # -----------------------------------------------------------------------
 
-    def route_after_reflect(state: AgentState) -> Literal["planner", "final_report"]:
+    def route_after_planner(state: AgentState) -> Literal["planner", "evaluate", "final_report"]:
+        addendum = state.get("planner_addendum") or {}
+        if addendum.get("stop") or state.get("decision") == "finish":
+            return "final_report"
+        if addendum.get("submit"):
+            return "evaluate"
+        return "planner"
+
+    def route_after_critic(state: AgentState) -> Literal["ideate", "planner", "final_report"]:
         if state.get("decision") == "finish":
             return "final_report"
+        if _ideator_roles:
+            return "ideate"
         return "planner"
 
     def route_after_final(state: AgentState) -> str:
         return "submit" if state.get("has_test_df") else "__end__"
 
-    graph = StateGraph(AgentState)
+    # -----------------------------------------------------------------------
+    # Build graph
+    # -----------------------------------------------------------------------
 
-    graph.add_node("profile", profile_node)
-    graph.add_node("analyze", analyze_node)
+    graph = StateGraph(AgentState)
+    graph.add_node("preprocess", preprocess_node)
+    graph.add_node("summarise", summarise_node)
+    graph.add_node("ideate", ideate_node)
     graph.add_node("planner", planner_node)
-    graph.add_node("apply", apply_node)
     graph.add_node("evaluate", evaluate_node)
-    graph.add_node("reflect", reflect_node)
+    graph.add_node("critic", critic_node)
     graph.add_node("final_report", final_report_node)
     graph.add_node("submit", submit_node)
 
-    graph.add_edge(START, "profile")
-    graph.add_edge("profile", "analyze")
-    graph.add_edge("analyze", "planner")
+    graph.add_edge(START, "preprocess")
+    graph.add_edge("preprocess", "summarise")
+    # After summarise: ideate first if roles are configured, else straight to planner
+    if _ideator_roles:
+        graph.add_edge("summarise", "ideate")
+        graph.add_edge("ideate", "planner")
+    else:
+        graph.add_edge("summarise", "planner")
     graph.add_conditional_edges(
-        "planner", route_after_planner, {"apply": "apply", "final_report": "final_report"}
+        "planner",
+        route_after_planner,
+        {"planner": "planner", "evaluate": "evaluate", "final_report": "final_report"},
     )
-    graph.add_edge("apply", "evaluate")
-    graph.add_edge("evaluate", "reflect")
+    graph.add_edge("evaluate", "critic")
     graph.add_conditional_edges(
-        "reflect", route_after_reflect, {"planner": "planner", "final_report": "final_report"}
+        "critic",
+        route_after_critic,
+        {"ideate": "ideate", "planner": "planner", "final_report": "final_report"},
     )
     graph.add_conditional_edges(
         "final_report",

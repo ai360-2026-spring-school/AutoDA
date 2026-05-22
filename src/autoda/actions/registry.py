@@ -1,5 +1,7 @@
 from typing import Callable, Literal
 
+from .catalog import build_catalog, format_catalog_compact
+
 from .clean import (impute_missing, drop_columns, drop_duplicates, clip_outliers,
                     collapse_rare_categories, cast_dtype)
 from .fe import (expand_datetime, binarize_missing, log_transform, bin_numeric,
@@ -7,8 +9,12 @@ from .fe import (expand_datetime, binarize_missing, log_transform, bin_numeric,
 from .encode import (frequency_encode, target_encode_oof, one_hot,
                      standard_scale, min_max_scale)
 from .select import drop_constant, drop_high_corr, drop_low_importance
+from .lambda_transform import multi_col_lambda
 from .info import sparse_linear_features, baseline_linear_model
-from .catalog import build_catalog, format_catalog
+from .info_new import (
+    groupby_agg, value_counts, correlation_matrix,
+    describe_column, view_precomputed_stats, view_long_summary,
+)
 
 TRANSFORMERS: dict[str, Callable] = {
     "impute_missing": impute_missing,
@@ -31,11 +37,18 @@ TRANSFORMERS: dict[str, Callable] = {
     "drop_constant": drop_constant,
     "drop_high_corr": drop_high_corr,
     "drop_low_importance": drop_low_importance,
+    "multi_col_lambda": multi_col_lambda,
 }
 
 INFO_TOOLS: dict[str, Callable] = {
     "sparse_linear_features": sparse_linear_features,
     "baseline_linear_model": baseline_linear_model,
+    "groupby_agg": groupby_agg,
+    "value_counts": value_counts,
+    "correlation_matrix": correlation_matrix,
+    "describe_column": describe_column,
+    "view_precomputed_stats": view_precomputed_stats,
+    "view_long_summary": view_long_summary,
 }
 
 REGISTRY: dict[str, Callable] = {**TRANSFORMERS, **INFO_TOOLS}
@@ -49,14 +62,9 @@ def kind_of(op: str) -> Literal["transformer", "info"]:
     raise KeyError(f"unknown operation: {op!r}")
 
 
-# Catalog is *derived* from the live action functions' signatures + docstrings —
-# the source of truth lives next to the implementation, not in this file.
 CATALOG: list[dict] = build_catalog(TRANSFORMERS, INFO_TOOLS)
-
-# Back-compat alias for older callers — same content, new variable name.
 SCHEMA: list[dict] = CATALOG
 
 
 def catalog_text() -> str:
-    """Pre-rendered catalog text for the planner prompt."""
-    return format_catalog(CATALOG)
+    return format_catalog_compact(CATALOG)

@@ -1,3 +1,4 @@
+import warnings
 from typing import Any
 import numpy as np
 import pandas as pd
@@ -39,36 +40,40 @@ def sparse_linear_features(
             return {"error": "target column not in df"}
 
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        # Clip before scaling to prevent overflow in matmul (large values → inf)
+        X_clipped = X.clip(lower=X.quantile(0.001), upper=X.quantile(0.999), axis=1)
+        X_scaled = scaler.fit_transform(X_clipped)
 
-        if task == "regression":
-            if alpha is not None:
-                model = Lasso(alpha=alpha, random_state=RANDOM_SEED, max_iter=5000)
-                model.fit(X_scaled, y)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if task == "regression":
+                if alpha is not None:
+                    model = Lasso(alpha=alpha, random_state=RANDOM_SEED, max_iter=5000)
+                    model.fit(X_scaled, y)
+                else:
+                    cv = KFold(n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
+                    model = LassoCV(cv=cv, random_state=RANDOM_SEED, max_iter=5000)
+                    model.fit(X_scaled, y)
+                    alpha = float(model.alpha_)
+                coefs = model.coef_
+                model_name = "lasso"
             else:
-                cv = KFold(n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
-                model = LassoCV(cv=cv, random_state=RANDOM_SEED, max_iter=5000)
+                scoring = "roc_auc" if task == "binary" else "neg_log_loss"
+                cv_splitter = StratifiedKFold(
+                    n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED
+                )
+                model = LogisticRegressionCV(
+                    penalty="l1", solver="saga", scoring=scoring,
+                    cv=cv_splitter, random_state=RANDOM_SEED, max_iter=2000,
+                )
                 model.fit(X_scaled, y)
-                alpha = float(model.alpha_)
-            coefs = model.coef_
-            model_name = "lasso"
-        else:
-            scoring = "roc_auc" if task == "binary" else "neg_log_loss"
-            cv_splitter = StratifiedKFold(
-                n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED
-            )
-            model = LogisticRegressionCV(
-                penalty="l1", solver="saga", scoring=scoring,
-                cv=cv_splitter, random_state=RANDOM_SEED, max_iter=2000,
-            )
-            model.fit(X_scaled, y)
-            coefs = model.coef_[0] if model.coef_.ndim > 1 else model.coef_
-            alpha = (
-                float(np.mean(list(model.C_.values())))
-                if hasattr(model.C_, "values")
-                else float(model.C_)
-            )
-            model_name = "logreg_l1"
+                coefs = model.coef_[0] if model.coef_.ndim > 1 else model.coef_
+                alpha = (
+                    float(np.mean(list(model.C_.values())))
+                    if hasattr(model.C_, "values")
+                    else float(model.C_)
+                )
+                model_name = "logreg_l1"
 
         feat_coefs = sorted(
             zip(numeric_cols, coefs.tolist()),
@@ -122,28 +127,30 @@ def baseline_linear_model(
         y = df[target]
 
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        X_clipped = X.clip(lower=X.quantile(0.001), upper=X.quantile(0.999), axis=1)
+        X_scaled = scaler.fit_transform(X_clipped)
 
-        if task == "regression":
-            model = LinearRegression()
-            cv = KFold(n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
-            scores = cross_val_score(
-                model, X_scaled, y, cv=cv, scoring="neg_root_mean_squared_error"
-            )
-            cv_scores = (-scores).tolist()
-            metric = "rmse"
-            model_name = "linreg"
-        else:
-            model = LogisticRegression(
-                max_iter=1000, random_state=RANDOM_SEED,
-                multi_class="auto" if task == "multiclass" else "auto",
-            )
-            cv = StratifiedKFold(n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
-            scoring = "roc_auc" if task == "binary" else "neg_log_loss"
-            scores = cross_val_score(model, X_scaled, y, cv=cv, scoring=scoring)
-            cv_scores = (scores if task == "binary" else -scores).tolist()
-            metric = "roc_auc" if task == "binary" else "log_loss"
-            model_name = "logreg"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if task == "regression":
+                model = LinearRegression()
+                cv = KFold(n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
+                scores = cross_val_score(
+                    model, X_scaled, y, cv=cv, scoring="neg_root_mean_squared_error"
+                )
+                cv_scores = (-scores).tolist()
+                metric = "rmse"
+                model_name = "linreg"
+            else:
+                model = LogisticRegression(
+                    max_iter=1000, random_state=RANDOM_SEED,
+                )
+                cv = StratifiedKFold(n_splits=DEFAULT_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
+                scoring = "roc_auc" if task == "binary" else "neg_log_loss"
+                scores = cross_val_score(model, X_scaled, y, cv=cv, scoring=scoring)
+                cv_scores = (scores if task == "binary" else -scores).tolist()
+                metric = "roc_auc" if task == "binary" else "log_loss"
+                model_name = "logreg"
 
         return {
             "summary": "linear baseline reference",
