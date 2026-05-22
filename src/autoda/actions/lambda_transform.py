@@ -72,12 +72,29 @@ def _apply_lambda(state: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _auto_detect_input_columns(expression: str, df_columns: list[str]) -> list[str]:
+    """Infer input_columns from expression by checking which df columns appear in it."""
+    found = []
+    # Check col('name') pattern first
+    col_refs = re.findall(r"col\(['\"]([^'\"]+)['\"]\)", expression)
+    found.extend(col_refs)
+    # Check sanitized names
+    for col in df_columns:
+        safe = _sanitize_varname(col)
+        # match as whole word (not substring of longer identifier)
+        if re.search(r'\b' + re.escape(safe) + r'\b', expression) and col not in found:
+            found.append(col)
+        elif col in expression and col not in found:
+            found.append(col)
+    return found
+
+
 def multi_col_lambda(
     df: pd.DataFrame,
     target: str,
     *,
     expression: str,
-    input_columns: list[str],
+    input_columns: list[str] | None = None,
     result_column: str,
 ) -> tuple[pd.DataFrame, Transformer, dict[str, Any]]:
     """Apply a vectorised Python expression over one or more columns.
@@ -93,6 +110,14 @@ def multi_col_lambda(
     """
     if result_column == target:
         raise ValueError(f"result_column cannot be the target column '{target}'.")
+    # Auto-detect input_columns if not provided
+    if input_columns is None:
+        input_columns = _auto_detect_input_columns(expression, list(df.columns))
+        if not input_columns:
+            raise ValueError(
+                "input_columns not provided and could not be auto-detected from expression. "
+                "Please specify input_columns explicitly."
+            )
     missing = [c for c in input_columns if c not in df.columns]
     if missing:
         raise ValueError(f"input_columns not found in dataframe: {missing}")
