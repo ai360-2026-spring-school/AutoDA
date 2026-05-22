@@ -18,11 +18,45 @@ Key difference from PDAgent:
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Global semaphore shared across all BeamSearchAgent instances in one process.
+# Prevents hammering LLM APIs with too many simultaneous requests.
+_LLM_SEMAPHORE: threading.Semaphore | None = None
+_LLM_SEMAPHORE_LOCK = threading.Lock()
+
+def set_llm_concurrency(max_concurrent: int) -> None:
+    """Set the global LLM concurrency limit. Call once before running agents."""
+    global _LLM_SEMAPHORE
+    with _LLM_SEMAPHORE_LOCK:
+        _LLM_SEMAPHORE = threading.Semaphore(max_concurrent)
+
+def _llm_invoke(model, prompt: str, max_retries: int = 3, retry_delay: float = 5.0):
+    """Invoke model with semaphore guard + exponential backoff on 429."""
+    sem = _LLM_SEMAPHORE
+    ctx = sem if sem is not None else _NullCtx()
+    with ctx:
+        for attempt in range(max_retries):
+            try:
+                response = model.invoke(prompt)
+                return response
+            except Exception as e:
+                err = str(e)
+                if "429" in err and attempt < max_retries - 1:
+                    wait = retry_delay * (2 ** attempt)
+                    time.sleep(wait)
+                    continue
+                raise
+
+class _NullCtx:
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
 
 import pandas as pd
 
@@ -538,7 +572,7 @@ class BeamSearchAgent:
             root_columns=self._root_columns,
         )
         try:
-            response = self.planner.invoke(prompt)
+            response = _llm_invoke(self.planner, prompt)
             content = getattr(response, "content", None) or ""
             # Parse JSON list
             content = content.strip()
@@ -583,7 +617,7 @@ class BeamSearchAgent:
             root_columns=self._root_columns,
         )
         try:
-            response = self.critic.invoke(prompt)
+            response = _llm_invoke(self.critic, prompt)
             content = getattr(response, "content", None) or ""
             parsed = parse_json_response(content)
             if "_parse_error" in parsed:
@@ -648,7 +682,7 @@ class BeamSearchAgent:
             )
 
             try:
-                response = self.implementer.invoke(prompt)
+                response = _llm_invoke(self.implementer, prompt)
                 text = getattr(response, "content", None) or ""
             except Exception as e:
                 self._dbg(f"[impl/{node_id}] LLM error: {e}")
