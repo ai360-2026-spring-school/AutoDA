@@ -10,12 +10,16 @@ def make_model(
     model_name: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 1000,
+    agent_id: str | None = None,
+    base_url: str | None = None,
 ):
     if provider == "timeweb":
         return make_timeweb_model(
             model_name=model_name,
             temperature=temperature,
             max_tokens=max_tokens,
+            agent_id=agent_id,
+            base_url=base_url,
         )
 
     if provider == "gigachat":

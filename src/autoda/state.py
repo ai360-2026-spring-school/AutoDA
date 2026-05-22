@@ -51,3 +51,6 @@ class AgentState(TypedDict):
     # --- Planner turn control ---
     planner_addendum: dict[str, Any] | None
     planner_turn_count: int
+
+    # --- Ideator suggestions (replace-semantics, refreshed each iteration) ---
+    ideator_suggestions: list[dict[str, Any]]

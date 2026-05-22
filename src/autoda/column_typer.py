@@ -31,8 +31,10 @@ def detect_column_types(
     target: str,
     unique_threshold: int = NUMERIC_UNIQUE_THRESHOLD,
 ) -> dict[str, ColumnKind]:
-    return {
-        col: detect_column_type(df[col], unique_threshold)
-        for col in df.columns
-        if col != target
-    }
+    result: dict[str, ColumnKind] = {}
+    for i, col in enumerate(df.columns):
+        if col == target:
+            continue
+        series = df.iloc[:, i]  # positional access avoids DataFrame return on duplicate col names
+        result[col] = detect_column_type(series, unique_threshold)
+    return result

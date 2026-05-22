@@ -75,6 +75,7 @@ class PDAgent:
         self,
         provider: Literal["timeweb", "gigachat"] = "timeweb",
         model: str | None = None,
+        agent_id: str | None = None,
         max_iterations: int = 20,
         tolerance: float = 1e-4,
         n_splits: int = 5,
@@ -85,9 +86,17 @@ class PDAgent:
         max_inner_turns: int = 15,
         debug: bool = False,
         critic_every: int = 3,
+        critic_provider: Literal["timeweb", "gigachat"] | None = None,
+        critic_model_name: str | None = None,
+        critic_agent_id: str | None = None,
+        n_ideators: int = 0,
+        ideator_provider: Literal["timeweb", "gigachat"] | None = None,
+        ideator_model_name: str | None = None,
+        ideator_agent_id: str | None = None,
     ):
         self.provider = provider
         self.model_name = model
+        self.agent_id = agent_id
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.n_splits = n_splits
@@ -98,6 +107,13 @@ class PDAgent:
         self.max_inner_turns = max_inner_turns
         self.debug = debug
         self.critic_every = critic_every
+        self.critic_provider = critic_provider
+        self.critic_model_name = critic_model_name
+        self.critic_agent_id = critic_agent_id
+        self.n_ideators = n_ideators
+        self.ideator_provider = ideator_provider
+        self.ideator_model_name = ideator_model_name
+        self.ideator_agent_id = ideator_agent_id
 
     def run(
         self,
@@ -128,7 +144,36 @@ class PDAgent:
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            agent_id=self.agent_id,
         )
+
+        critic_llm = None
+        if self.critic_provider is not None:
+            critic_llm = make_model(
+                provider=self.critic_provider,
+                model_name=self.critic_model_name,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                agent_id=self.critic_agent_id,
+            )
+            if self.debug:
+                label = self.critic_model_name or self.critic_agent_id or self.critic_provider
+                print(f"[autoda] critic={label}", flush=True)
+
+        ideator_llm = None
+        if self.n_ideators > 0:
+            _ideator_prov = self.ideator_provider or self.provider
+            ideator_llm = make_model(
+                provider=_ideator_prov,
+                model_name=self.ideator_model_name,
+                temperature=0.7,  # slight warmth for diversity
+                max_tokens=400,   # short answers only
+                agent_id=self.ideator_agent_id,
+            )
+            if self.debug:
+                from .prompts import IDEATOR_ROLES as _ROLES
+                _roles_preview = ", ".join(r["name"] for r in _ROLES[:self.n_ideators])
+                print(f"[autoda] ideators={self.n_ideators} ({_roles_preview})", flush=True)
 
         # Resolve description (raw text — summarisation happens in summarise_node)
         resolved_description: str | None = _coerce_description(description)
@@ -183,6 +228,9 @@ class PDAgent:
             max_inner_turns=self.max_inner_turns,
             debug=self.debug,
             critic_every=self.critic_every,
+            critic_model=critic_llm,
+            n_ideators=self.n_ideators,
+            ideator_model=ideator_llm,
         )
 
         initial_state = {
@@ -213,6 +261,7 @@ class PDAgent:
             "iteration_start_cv": None,
             "planner_addendum": None,
             "planner_turn_count": 0,
+            "ideator_suggestions": [],
         }
 
         final_state: dict[str, Any] | None = None

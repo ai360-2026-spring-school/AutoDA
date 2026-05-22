@@ -171,10 +171,12 @@ def run_preprocess(
         if n_uniq >= ohe_max_cardinality:
             continue
         _dtype = df[_c].dtype
-        # Skip bool and binary numeric (0/1) columns — already fine for CatBoost
+        # Skip bool columns — already fine for CatBoost
         if pd.api.types.is_bool_dtype(_dtype):
             continue
-        if pd.api.types.is_numeric_dtype(_dtype) and n_uniq <= 2:
+        # Skip ALL numeric columns regardless of cardinality — CatBoost handles them natively;
+        # agent can OHE explicitly if needed (ordinal integers stay continuous)
+        if pd.api.types.is_numeric_dtype(_dtype):
             continue
         ohe_cols.append(_c)
 

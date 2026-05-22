@@ -50,6 +50,18 @@ _PLANNER_BASE = """\
 === ОПИСАНИЕ ЗАДАЧИ (короткое) ===
 {short_summary}
 
+╔══════════════════════════════════════════════════════════╗
+║  ДИРЕКТИВА КРИТИКА — ОБЯЗАТЕЛЬНО ВЫПОЛНИ НА ЭТОМ ШАГЕ  ║
+╚══════════════════════════════════════════════════════════╝
+{critic_message}
+
+┌─────────────────────────────────────────────────────────┐
+│  ПРЕДЛОЖЕНИЯ ИДЕАТОРОВ — ВЫПОЛНИ HIGH-PRIORITY ПЕРВЫМ  │
+│  Если есть high → реализуй его, не придумывай своё.    │
+│  Если high нет или всё уже пробовал — действуй сам.    │
+└─────────────────────────────────────────────────────────┘
+{ideator_suggestions}
+
 === ТИПЫ КОЛОНОК ===
 {column_type_map}
 
@@ -62,11 +74,20 @@ _PLANNER_BASE = """\
 === ТЕКУЩАЯ ИТЕРАЦИЯ (шаг {step}) — уже применено ===
 {current_iter_transforms}
 
-=== СООБЩЕНИЕ КРИТИКА ===
-{critic_message}
-
 === КАТАЛОГ ОПЕРАЦИЙ ===
 {catalog}
+
+=== ЧТО ДАЁТ ПРИРОСТ С CATBOOST, А ЧТО НЕТ ===
+CatBoost — дерево решений. Он УЖЕ умеет:
+  ✓ Категориальные фичи нативно — OHE вручную НЕ нужен
+  ✓ Нелинейность (полиномы, квадраты) — сам строит через сплиты
+  ✓ Масштаб и порядок значений — стандартизация НЕ нужна
+
+CatBoost НЕ умеет без явных признаков:
+  ✗ Произведение двух непрерывных (A × B) — добавляй явно через interaction
+  ✗ Отношение (A / B) — добавляй явно через interaction(op="div")
+  ✗ Логарифм сильно скошенной фичи — добавляй явно через log_transform
+  ✗ Агрегаты по группе (mean_target_by_category) — добавляй через group_aggregate
 
 === ДОСТУПНЫЕ ДЕЙСТВИЯ ===
 Выбери ОДНО действие и верни строгий JSON.
@@ -91,10 +112,14 @@ _PLANNER_BASE = """\
 {{"type": "stop", "reason": "причина"}}
 
 ВАЖНО:
+- Директива критика выше — это КОМАНДА, не совет. Если она есть — выполни её первой.
 - Не повторяй уже отклонённые операции из лога
 - group_aggregate принимает ОДИН by (str) и ОДИН value (str), не список
 - multi_col_lambda: для колонок с пробелами/спецсимволами ОБЯЗАТЕЛЬНО используй col('имя').
   Пример: {{"expression": "col('LapTime (s)') * TyreLife", "input_columns": ["LapTime (s)", "TyreLife"], "result_column": "lap_x_tyre"}}
+- ЛИМИТ ТРАНСФОРМАЦИЙ: делай НЕ БОЛЕЕ 2 трансформаций за итерацию, затем submit.
+  Пакет из 5+ действий нельзя откатать по частям — если он провалится, непонятно что именно помешало.
+  Лучше принять 1 фичу и потерять 0, чем отклонить пакет из 5 хороших фич вместе с 1 плохой.
 """
 
 _PLANNER_ADDENDUM_TEMPLATES: dict[str, str] = {
@@ -149,6 +174,9 @@ def build_planner_prompt(state: dict[str, Any]) -> str:
 
     critic = state.get("critic_message") or "(нет)"
 
+    suggestions = state.get("ideator_suggestions", [])
+    suggestions_str = format_ideator_suggestions(suggestions)
+
     iter_transforms = state.get("current_iteration_transforms", [])
     step = state.get("current_step", 0) + 1
     if iter_transforms:
@@ -168,6 +196,7 @@ def build_planner_prompt(state: dict[str, Any]) -> str:
         experiment_log=log_text,
         log_count=log_count,
         critic_message=critic,
+        ideator_suggestions=suggestions_str,
         catalog=_CATALOG_COMPACT,
         step=step,
         current_iter_transforms=current_iter_str,
@@ -282,34 +311,211 @@ def _format_iter_transforms(transforms: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Ideator roles and prompt
+# ---------------------------------------------------------------------------
+
+IDEATOR_ROLES: list[dict[str, str]] = [
+    {
+        "name": "Математик",
+        "instruction": (
+            "Ты — Математик. Предложи ОДНУ трансформацию основанную на математических свойствах: "
+            "отношения признаков (A/B), произведения непрерывных (A×B), логарифм сильно скошенных, "
+            "разности (A−B), корни. Думай о нелинейностях которые дерево не строит само."
+        ),
+    },
+    {
+        "name": "Доменный эксперт",
+        "instruction": (
+            "Ты — Доменный эксперт. Используй описание датасета и здравый смысл предметной области. "
+            "Предложи ОДНУ физически или содержательно осмысленную комбинацию признаков. "
+            "Например: сила = масса × расстояние, стоимость на кг = цена / вес."
+        ),
+    },
+    {
+        "name": "Стратег",
+        "instruction": (
+            "Ты — Стратег. Внимательно прочитай историю экспериментов. "
+            "Найди то, что ЕЩЁ НЕ ПРОБОВАЛИ из доступных признаков. "
+            "Предложи ОДНУ идею из принципиально нового направления — не повторяй отклонённые."
+        ),
+    },
+    {
+        "name": "Аналитик взаимодействий",
+        "instruction": (
+            "Ты — Аналитик взаимодействий. Специализируешься на парных взаимодействиях. "
+            "Предложи ОДНУ пару признаков, которые вместе несут больше информации чем по отдельности. "
+            "Обоснуй почему именно эта пара важна для таргета."
+        ),
+    },
+    {
+        "name": "Энкодер",
+        "instruction": (
+            "Ты — Энкодер. Специализируешься на работе с категориальными и дискретными переменными: "
+            "target encoding (group_aggregate), frequency encoding, взаимодействия кат×числовой. "
+            "Предложи ОДНУ идею по лучшему использованию категориальных признаков."
+        ),
+    },
+]
+
+_IDEATOR_PROMPT_TEMPLATE = """\
+Задача ML: {task}, таргет={target}, метрика={metric_name} ({metric_direction}).
+Текущий CV: {current_cv:.4f} (baseline: {baseline_cv:.4f}).
+{description_line}
+
+Колонки датасета:
+{columns}
+
+История последних экспериментов (REJECTED = не сработало, не повторяй!):
+{history}
+
+УЖЕ ОТКЛОНЁННЫЕ операции (ЗАПРЕЩЕНО предлагать снова — priority должен быть low):
+{rejected_ops}
+
+{instruction}
+
+ВАЖНО:
+- Если предлагаешь операцию из списка "уже отклонённых" — поставь priority: "low"
+- Предлагай конкретную пару/тройку колонок с реальными именами из списка выше
+- Не предлагай нормализацию/стандартизацию — деревья не нуждаются
+
+Верни СТРОГО JSON без пояснений:
+{{"suggestion": "конкретное действие: op(col1, col2)", "rationale": "почему должно помочь", "priority": "high|medium|low"}}"""
+
+
+def build_ideator_prompt(state: dict[str, Any], role_instruction: str) -> str:
+    """Short single-turn prompt for one ideator role."""
+    target = state["target"]
+    task = state.get("task", "regression")
+    metric_name = state.get("metric_name", "cv")
+    metric_direction = state.get("metric_direction", "min")
+    baseline_cv = state.get("baseline_cv_mean") or 0.0
+
+    # Current CV from last experiment
+    exp_log = state.get("experiment_log", [])
+    if exp_log:
+        current_cv = exp_log[-1].get("cv_after") or baseline_cv
+    else:
+        current_cv = baseline_cv
+
+    col_map = state.get("column_type_map", {})
+    cols_str = "\n".join(
+        f"  {col} ({kind})" for col, kind in sorted(col_map.items()) if col != target
+    ) or "  (нет данных)"
+
+    short_summary = state.get("short_description_summary", "")
+    description_line = f"Описание: {short_summary}" if short_summary else ""
+
+    recent = exp_log[-10:]
+    history_lines = []
+    for e in recent:
+        ops = ", ".join(t.get("op", "?") for t in e.get("transforms", []))
+        decision = e.get("decision", "?")
+        delta = e.get("delta", 0.0)
+        history_lines.append(f"  шаг {e.get('step')}: {decision} ({delta:+.4f}) — {ops}")
+    history_str = "\n".join(history_lines) if history_lines else "  (история пуста)"
+
+    # Build compact list of rejected op signatures to explicitly block
+    rejected_sigs: set[str] = set()
+    for e in exp_log:
+        if e.get("decision") == "reject":
+            for t in e.get("transforms", []):
+                op = t.get("op", "")
+                args = t.get("args", {})
+                cols = args.get("cols", args.get("columns", []))
+                if isinstance(cols, list):
+                    sig = f"{op}({','.join(sorted(str(c) for c in cols))})"
+                else:
+                    sig = f"{op}({cols})"
+                rejected_sigs.add(sig)
+    rejected_ops_str = "\n".join(f"  - {s}" for s in sorted(rejected_sigs)) or "  (нет)"
+
+    return _IDEATOR_PROMPT_TEMPLATE.format(
+        task=task,
+        target=target,
+        metric_name=metric_name,
+        metric_direction=metric_direction,
+        current_cv=current_cv,
+        baseline_cv=baseline_cv,
+        description_line=description_line,
+        columns=cols_str,
+        history=history_str,
+        rejected_ops=rejected_ops_str,
+        instruction=role_instruction,
+    )
+
+
+def format_ideator_suggestions(suggestions: list[dict[str, Any]]) -> str:
+    """Format ideator suggestions for inclusion in planner prompt."""
+    if not suggestions:
+        return "(нет предложений от идеаторов)"
+    lines = []
+    for s in suggestions:
+        role = s.get("role", "?")
+        suggestion = s.get("suggestion", "")
+        rationale = s.get("rationale", "")
+        priority = s.get("priority", "medium")
+        lines.append(f"  [{role}] ({priority}) {suggestion} — {rationale}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Critic prompt
 # ---------------------------------------------------------------------------
 
 CRITIC_PROMPT = """\
-Ты — критик агента по разработке признаков.
+Ты — супервизор агента по разработке признаков. Модель оценки — CatBoost (деревья решений).
 
 ОПИСАНИЕ ЗАДАЧИ:
 {long_summary}
 
+ТАРГЕТ (его нельзя трансформировать): {target}
+
+ДОСТУПНЫЕ КОЛОНКИ В ДАТАСЕТЕ (используй ТОЛЬКО эти имена):
+{column_type_map}
+
 ЛОГ ВСЕХ ЭКСПЕРИМЕНТОВ (последние {log_count}):
 {experiment_log}
 
-Твоя задача: проанализировать поведение агента и дать короткий комментарий (1-3 предложения) ТОЛЬКО если видишь реальную проблему:
-- Агент несколько раз подряд пробует похожие изменения, которые отклоняются
-- Агент игнорирует очевидно важные колонки из описания задачи
-- Агент застрял в бесполезном цикле действий
+Твоя задача — дать агенту КОНКРЕТНУЮ ДИРЕКТИВУ на следующий шаг.
 
-Если поведение агента разумное — верни null.
+Правила CatBoost, которые нарушает агент:
+- Нормализация/стандартизация — бесполезна для деревьев, не предлагай
+- Полиномы (age², age³) — деревья строят нелинейность сами, польза минимальна
+- OHE вручную — CatBoost обрабатывает категориальные нативно
+- НЕЛЬЗЯ трансформировать таргет ({target})
 
-Ответь СТРОГО в формате JSON: {{"message": "текст критики" или null}}"""
+Что действительно помогает CatBoost:
+- Отношения двух непрерывных (A/B): cement/water, bmi/age, distance/weight
+- Произведения (A×B): особенно когда обе фичи значимы по отдельности
+- Логарифм сильно скошенных фич (skew > 2)
+- Агрегаты по категориальной группе (mean_target_by_category)
+
+Анализируй лог и выбери ОДИН из трёх вариантов ответа:
+
+1. Если агент застрял (3+ отклонений одного типа) — напиши прямую команду:
+   "Прекрати [X]. Следующий шаг: [конкретная операция, используя ТОЛЬКО существующие колонки из списка выше]."
+
+2. Если агент игнорирует важную область из описания задачи — напиши:
+   "Ещё не исследовано: [конкретная фича]. Попробуй [операция с реальными именами колонок]."
+
+3. Если поведение разумное — верни null.
+
+Ответь СТРОГО в формате JSON: {{"message": "директива" или null}}"""
 
 
 def build_critic_prompt(state: dict[str, Any]) -> str:
     long_summary = (state.get("long_description_summary") or "(описание не задано)")[:1000]
     exp_log = state.get("experiment_log", [])
     log_text, log_count = _format_experiment_log(exp_log, last_n=20)
+    target = state.get("target", "target")
+    col_map = state.get("column_type_map", {})
+    col_map_str = ", ".join(
+        f"{col}({kind})" for col, kind in sorted(col_map.items())
+    ) or "(нет данных)"
     return CRITIC_PROMPT.format(
         long_summary=long_summary,
+        target=target,
+        column_type_map=col_map_str,
         experiment_log=log_text,
         log_count=log_count,
     )

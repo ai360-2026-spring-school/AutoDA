@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,6 +25,8 @@ from .prompts import (
     build_planner_prompt,
     build_critic_prompt,
     build_final_report_prompt,
+    build_ideator_prompt,
+    IDEATOR_ROLES,
 )
 
 _INFO_TOOLS_NEW = {
@@ -93,6 +96,9 @@ def build_graph(
     max_inner_turns: int = 15,
     debug: bool = False,
     critic_every: int = 3,
+    critic_model=None,
+    n_ideators: int = 0,
+    ideator_model=None,
 ):
     reports_dir = Path(reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -212,6 +218,64 @@ def build_graph(
             "short_description_summary": short_summary,
             "planner_memory": initial_memory,
         }
+
+    # -----------------------------------------------------------------------
+    # Phase 2b: Ideator node (runs once per iteration before planner turn 1)
+    # -----------------------------------------------------------------------
+
+    _ideator_model = ideator_model if ideator_model is not None else model
+    _ideator_roles = IDEATOR_ROLES[:n_ideators] if n_ideators > 0 else []
+
+    def _call_one_ideator(role: dict[str, str], state: AgentState) -> dict[str, Any] | None:
+        """Call model with one ideator role. Returns suggestion dict or None on failure."""
+        try:
+            prompt = build_ideator_prompt(state, role["instruction"])
+            response = _ideator_model.invoke(prompt)
+            content = getattr(response, "content", None) or ""
+            parsed = parse_json_response(content)
+            if "_parse_error" in parsed:
+                return None
+            suggestion = parsed.get("suggestion", "").strip()
+            if not suggestion:
+                return None
+            return {
+                "role": role["name"],
+                "suggestion": suggestion,
+                "rationale": parsed.get("rationale", "")[:200],
+                "priority": parsed.get("priority", "medium"),
+            }
+        except Exception:
+            return None
+
+    def ideate_node(state: AgentState) -> dict[str, Any]:
+        if not _ideator_roles:
+            return {"ideator_suggestions": []}
+
+        suggestions: list[dict[str, Any]] = []
+
+        # Call all ideators in parallel
+        with ThreadPoolExecutor(max_workers=len(_ideator_roles)) as pool:
+            futures = {
+                pool.submit(_call_one_ideator, role, state): role["name"]
+                for role in _ideator_roles
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    suggestions.append(result)
+
+        # Sort by priority: high → medium → low
+        _priority_order = {"high": 0, "medium": 1, "low": 2}
+        suggestions.sort(key=lambda s: _priority_order.get(s.get("priority", "medium"), 1))
+
+        step = state.get("current_step", 0) + 1
+        if suggestions:
+            for s in suggestions:
+                _dbg(f"[ideate/{s['role']}:{s['priority']}] {s['suggestion'][:80]}")
+        else:
+            _dbg(f"[ideate] step {step}: no suggestions (all failed or empty)")
+
+        return {"ideator_suggestions": suggestions}
 
     # -----------------------------------------------------------------------
     # Phase 3: Planner node (self-loop)
@@ -584,8 +648,9 @@ def build_graph(
             return {"critic_message": None}
 
         prompt = build_critic_prompt(state)
+        _critic = critic_model if critic_model is not None else model
         try:
-            response = model.invoke(prompt)
+            response = _critic.invoke(prompt)
             content = getattr(response, "content", str(response))
             parsed = parse_json_response(content)
             if "_parse_error" in parsed:
@@ -713,9 +778,11 @@ def build_graph(
             return "evaluate"
         return "planner"
 
-    def route_after_critic(state: AgentState) -> Literal["planner", "final_report"]:
+    def route_after_critic(state: AgentState) -> Literal["ideate", "planner", "final_report"]:
         if state.get("decision") == "finish":
             return "final_report"
+        if _ideator_roles:
+            return "ideate"
         return "planner"
 
     def route_after_final(state: AgentState) -> str:
@@ -728,6 +795,7 @@ def build_graph(
     graph = StateGraph(AgentState)
     graph.add_node("preprocess", preprocess_node)
     graph.add_node("summarise", summarise_node)
+    graph.add_node("ideate", ideate_node)
     graph.add_node("planner", planner_node)
     graph.add_node("evaluate", evaluate_node)
     graph.add_node("critic", critic_node)
@@ -736,7 +804,12 @@ def build_graph(
 
     graph.add_edge(START, "preprocess")
     graph.add_edge("preprocess", "summarise")
-    graph.add_edge("summarise", "planner")
+    # After summarise: ideate first if roles are configured, else straight to planner
+    if _ideator_roles:
+        graph.add_edge("summarise", "ideate")
+        graph.add_edge("ideate", "planner")
+    else:
+        graph.add_edge("summarise", "planner")
     graph.add_conditional_edges(
         "planner",
         route_after_planner,
@@ -746,7 +819,7 @@ def build_graph(
     graph.add_conditional_edges(
         "critic",
         route_after_critic,
-        {"planner": "planner", "final_report": "final_report"},
+        {"ideate": "ideate", "planner": "planner", "final_report": "final_report"},
     )
     graph.add_conditional_edges(
         "final_report",
