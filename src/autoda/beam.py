@@ -303,6 +303,7 @@ class BeamSearchAgent:
         n_ideas: int = 4,
         max_depth: int = 5,
         max_impl_turns: int = 5,
+        n_trees: int = 1,
         tolerance: float = 1e-4,
         debug: bool = False,
     ):
@@ -314,6 +315,7 @@ class BeamSearchAgent:
         self.n_ideas = n_ideas
         self.max_depth = max_depth
         self.max_impl_turns = max_impl_turns
+        self.n_trees = max(1, n_trees)
         self.tolerance = tolerance
         self.debug = debug
 
@@ -349,11 +351,104 @@ class BeamSearchAgent:
         self._description = description
         self._numeric_unique_threshold = numeric_unique_threshold
 
-        # Baseline CV
+        # Baseline CV (computed once, shared across all trees)
         X0 = df.drop(columns=[target], errors="ignore")
         y0 = df[target]
         baseline = self.evaluator.cv(X0, y0, step=0)
         root_cv = baseline.mean
+        self._root_columns: set[str] = set(df.columns)
+        self._root_cv: float = root_cv
+
+        self._dbg(
+            f"[forest] root cv={root_cv:.4f} | "
+            f"n_trees={self.n_trees} beam={self.beam_width} n_ideas={self.n_ideas} depth={self.max_depth}"
+        )
+
+        if self.n_trees == 1:
+            # Fast path — no extra threading overhead
+            all_nodes = self._run_one_tree(
+                tree_id=0, df=df, test_df=test_df,
+                root_cv=root_cv, metric_direction=metric_direction,
+            )
+            tree_results = [all_nodes]
+        else:
+            # Parallel forest
+            tree_results: list[dict[str, TreeNode]] = [{}] * self.n_trees
+            with ThreadPoolExecutor(max_workers=self.n_trees) as pool:
+                futures = {
+                    pool.submit(
+                        self._run_one_tree,
+                        tree_id=tid, df=df, test_df=test_df,
+                        root_cv=root_cv, metric_direction=metric_direction,
+                    ): tid
+                    for tid in range(self.n_trees)
+                }
+                for future in as_completed(futures):
+                    tid = futures[future]
+                    tree_results[tid] = future.result()
+
+        # Merge all trees — prefix node_ids to avoid collisions
+        merged_nodes: dict[str, TreeNode] = {}
+        for tid, nodes in enumerate(tree_results):
+            for nid, node in nodes.items():
+                key = f"t{tid}_{nid}" if self.n_trees > 1 else nid
+                # re-key children_ids too
+                if self.n_trees > 1:
+                    node.node_id = key
+                    node.parent_id = f"t{tid}_{node.parent_id}" if node.parent_id else None
+                    node.children_ids = [f"t{tid}_{c}" for c in node.children_ids]
+                merged_nodes[key] = node
+
+        sign = 1 if metric_direction == "max" else -1
+        best_node = max(merged_nodes.values(), key=lambda n: sign * n.cv)
+
+        if self.n_trees > 1:
+            per_tree_best = []
+            for tid, nodes in enumerate(tree_results):
+                tb = max(nodes.values(), key=lambda n: sign * n.cv)
+                per_tree_best.append(tb.cv)
+                self._dbg(f"[forest] tree {tid}: best cv={tb.cv:.4f}")
+            self._dbg(
+                f"[forest] done | best={best_node.cv:.4f}  "
+                f"(range {min(per_tree_best):.4f}–{max(per_tree_best):.4f})"
+            )
+
+        # Save merged tree JSON
+        try:
+            tree_data = {
+                nid: {
+                    "node_id": n.node_id, "parent_id": n.parent_id,
+                    "depth": n.depth, "cv": n.cv, "idea_used": n.idea_used,
+                    "transforms_in_step": n.transforms_in_step,
+                    "children_ids": n.children_ids,
+                    "pruned": n.pruned, "error": n.error,
+                }
+                for nid, n in merged_nodes.items()
+            }
+            (reports_dir / "search_tree.json").write_text(
+                json.dumps(tree_data, indent=2, ensure_ascii=False)
+            )
+        except Exception:
+            pass
+
+        return BeamSearchResult(
+            best_node=best_node,
+            all_nodes=merged_nodes,
+            root_cv=root_cv,
+            best_cv=best_node.cv,
+            reports_dir=reports_dir,
+        )
+
+    def _run_one_tree(
+        self,
+        tree_id: int,
+        df: pd.DataFrame,
+        test_df: pd.DataFrame | None,
+        root_cv: float,
+        metric_direction: str,
+    ) -> dict[str, TreeNode]:
+        """Run a single beam search tree. Returns all_nodes dict."""
+        prefix = f"[tree{tree_id}]" if self.n_trees > 1 else "[beam]"
 
         root = TreeNode(
             node_id="root",
@@ -366,25 +461,19 @@ class BeamSearchAgent:
             transforms_chain=[],
             transforms_in_step=[],
         )
-        self._root_columns: set[str] = set(df.columns)
-        self._root_cv: float = root_cv
 
         all_nodes: dict[str, TreeNode] = {"root": root}
         beam: list[TreeNode] = [root]
-
-        self._dbg(f"[beam] root cv={root_cv:.4f} | beam_width={self.beam_width} n_ideas={self.n_ideas} max_depth={self.max_depth}")
+        sign = 1 if metric_direction == "max" else -1
 
         for depth in range(1, self.max_depth + 1):
-            self._dbg(f"[beam] === depth {depth} | beam size={len(beam)} ===")
+            self._dbg(f"{prefix} === depth {depth} | beam size={len(beam)} ===")
             next_candidates: list[TreeNode] = []
 
-            # For each node in current beam, generate ideas + implement in parallel
             for parent_node in beam:
                 ideas = self._generate_ideas(parent_node, root_cv)
                 if not ideas:
-                    self._dbg(f"[beam] {parent_node.node_id}: no ideas generated")
                     continue
-
                 children = self._implement_parallel(parent_node, ideas, depth, all_nodes)
                 for child in children:
                     parent_node.children_ids.append(child.node_id)
@@ -392,37 +481,29 @@ class BeamSearchAgent:
                     next_candidates.append(child)
 
             if not next_candidates:
-                self._dbg(f"[beam] no candidates at depth {depth}, stopping")
+                self._dbg(f"{prefix} no candidates at depth {depth}, stopping")
                 break
 
-            # Sort all candidates by CV (best first)
-            sign = 1 if metric_direction == "max" else -1
             next_candidates.sort(key=lambda n: sign * n.cv, reverse=True)
-
-            # Prune: mark all but top beam_width as pruned
             survivors = next_candidates[:self.beam_width]
             for node in next_candidates[self.beam_width:]:
                 node.pruned = True
 
             surviving_cvs = [f"{n.cv:.4f}" for n in survivors]
-            self._dbg(f"[beam] depth {depth}: {len(survivors)}/{len(next_candidates)} survive — cvs={surviving_cvs}")
+            self._dbg(f"{prefix} depth {depth}: {len(survivors)}/{len(next_candidates)} survive — cvs={surviving_cvs}")
 
-            # Run critic for each surviving branch (parallel)
+            # Optional critic
             if self.critic is not None:
                 with ThreadPoolExecutor(max_workers=len(survivors)) as pool:
-                    critic_futures = {
-                        pool.submit(self._run_critic, node): node
-                        for node in survivors
-                    }
+                    critic_futures = {pool.submit(self._run_critic, node): node for node in survivors}
                     for future in as_completed(critic_futures):
                         node = critic_futures[future]
                         directive = future.result()
                         node.critic_directive = directive
                         if directive:
-                            _dbg_short = directive[:70]
-                            self._dbg(f"[critic/{node.node_id}] {_dbg_short!r}")
+                            self._dbg(f"[critic/{node.node_id}] {directive[:70]!r}")
 
-            # Check if any survivor actually improved
+            # Stop if no improvement
             best_cv = survivors[0].cv
             improved = is_keep(
                 type("R", (), {"mean": best_cv, "metric_direction": metric_direction})(),
@@ -430,46 +511,14 @@ class BeamSearchAgent:
                 tol=self.tolerance,
             )
             if not improved:
-                self._dbg(f"[beam] no improvement at depth {depth}, stopping")
+                self._dbg(f"{prefix} no improvement at depth {depth}, stopping")
                 break
 
             beam = survivors
 
-        # Find overall best node
-        sign = 1 if metric_direction == "max" else -1
         best_node = max(all_nodes.values(), key=lambda n: sign * n.cv)
-
-        self._dbg(f"[beam] done | root={root_cv:.4f} best={best_node.cv:.4f} ({best_node.node_id})")
-
-        # Save tree JSON
-        try:
-            tree_data = {
-                nid: {
-                    "node_id": n.node_id,
-                    "parent_id": n.parent_id,
-                    "depth": n.depth,
-                    "cv": n.cv,
-                    "idea_used": n.idea_used,
-                    "transforms_in_step": n.transforms_in_step,
-                    "children_ids": n.children_ids,
-                    "pruned": n.pruned,
-                    "error": n.error,
-                }
-                for nid, n in all_nodes.items()
-            }
-            (reports_dir / "search_tree.json").write_text(
-                json.dumps(tree_data, indent=2, ensure_ascii=False)
-            )
-        except Exception:
-            pass
-
-        return BeamSearchResult(
-            best_node=best_node,
-            all_nodes=all_nodes,
-            root_cv=root_cv,
-            best_cv=best_node.cv,
-            reports_dir=reports_dir,
-        )
+        self._dbg(f"{prefix} done | root={root_cv:.4f} best={best_node.cv:.4f} ({best_node.node_id})")
+        return all_nodes
 
     # ------------------------------------------------------------------
     # Idea generation

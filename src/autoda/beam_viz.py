@@ -21,9 +21,12 @@ if TYPE_CHECKING:
 
 def ascii_tree(result: "BeamSearchResult") -> str:
     nodes = result.all_nodes
-    root = nodes["root"]
     best_id = result.best_node.node_id
     metric = "cv"
+    # Find all root nodes (nodes without a parent present in nodes)
+    roots = [n for n in nodes.values() if n.parent_id is None or n.parent_id not in nodes]
+    if not roots:
+        return "(empty tree)"
 
     lines: list[str] = []
 
@@ -41,11 +44,12 @@ def ascii_tree(result: "BeamSearchResult") -> str:
         for i, child in enumerate(children):
             _walk(child, child_prefix, i == len(children) - 1)
 
-    # Root line
-    lines.append(f"◉ root  cv={root.cv:.4f}  (baseline)")
-    children = [nodes[cid] for cid in root.children_ids if cid in nodes]
-    for i, child in enumerate(children):
-        _walk(child, "", i == len(children) - 1)
+    for ti, root in enumerate(roots):
+        prefix = f"◉ Tree {ti}  " if len(roots) > 1 else "◉ "
+        lines.append(f"{prefix}root  cv={root.cv:.4f}  (baseline)")
+        children = [nodes[cid] for cid in root.children_ids if cid in nodes]
+        for i, child in enumerate(children):
+            _walk(child, "", i == len(children) - 1)
 
     lines.append("")
     lines.append(f"Best: {result.best_node.node_id}  {result.root_cv:.4f} → {result.best_cv:.4f}  (-{result.improvement_pct:.1f}%)")
