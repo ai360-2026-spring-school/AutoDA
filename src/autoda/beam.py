@@ -141,6 +141,8 @@ _IDEA_GENERATOR_PROMPT = """\
 ТЕКУЩИЕ КОЛОНКИ ДАТАСЕТА:
 {columns}
 
+СТАТИСТИКА:
+{stats_line}
 ТЕКУЩИЙ CV: {current_cv:.4f} (baseline: {root_cv:.4f})
 УЖЕ ПРИМЕНЕНО В ЭТОЙ ВЕТКЕ:
 {branch_summary}
@@ -167,8 +169,8 @@ _IDEA_GENERATOR_PROMPT = """\
 
 Ответь СТРОГО JSON списком без пояснений:
 [
-  {{"idea": "добавить interaction(cement, water, op=div)", "rationale": "cement/water ratio — главный предиктор прочности"}},
-  {{"idea": "log_transform(age, plus_one=true)", "rationale": "возраст имеет нелинейный эффект"}},
+  {{"idea": "interaction(col_a, col_b, op=div)", "rationale": "обоснование почему это может помочь"}},
+  {{"idea": "log_transform(col_c, plus_one=true)", "rationale": "обоснование"}},
   ...
 ]"""
 
@@ -241,6 +243,53 @@ _IMPLEMENTER_ADDENDUM = {
 }
 
 
+def _compute_stats_line(df: pd.DataFrame, target: str, col_map: dict) -> str:
+    """Compact stats: top correlations with target + skewed numerics + cat cardinality."""
+    lines = []
+    num_cols = [c for c, t in col_map.items() if t.lower() == "numeric" and c != target]
+    cat_cols = [c for c, t in col_map.items() if t.lower() == "categorical" and c != target]
+
+    # Top correlations with target (numeric target or encoded binary)
+    try:
+        y = df[target]
+        if str(y.dtype) in ("object", "category"):
+            y = pd.factorize(y)[0]
+        elif y.dtype == object or not pd.api.types.is_numeric_dtype(y):
+            y = pd.factorize(y)[0]
+        # numeric targets (including 0/1) used as-is — factorize flips sign for binary
+        y = pd.to_numeric(y, errors="coerce").fillna(0)
+        corrs = {c: df[c].corr(pd.Series(y, index=df.index)) for c in num_cols if df[c].notna().any()}
+        top = sorted(corrs.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+        if top:
+            parts = ", ".join(f"{c}({v:+.2f})" for c, v in top)
+            lines.append(f"  Корреляция с таргетом (топ-5): {parts}")
+    except Exception:
+        pass
+
+    # Skewed numeric columns
+    try:
+        skewed = [(c, df[c].skew()) for c in num_cols if df[c].notna().sum() > 10]
+        skewed = [(c, s) for c, s in skewed if abs(s) > 1.5]
+        skewed.sort(key=lambda x: abs(x[1]), reverse=True)
+        if skewed:
+            parts = ", ".join(f"{c}(skew={s:.1f})" for c, s in skewed[:4])
+            lines.append(f"  Скошенные (log поможет): {parts}")
+    except Exception:
+        pass
+
+    # Categorical columns: cardinality + top values
+    for c in cat_cols[:4]:
+        try:
+            vc = df[c].value_counts()
+            n_unique = len(vc)
+            top_vals = ", ".join(f"'{v}'({cnt})" for v, cnt in vc.head(3).items())
+            lines.append(f"  {c}: {n_unique} категорий, топ: {top_vals}")
+        except Exception:
+            pass
+
+    return "\n".join(lines) if lines else "  (нет данных)"
+
+
 def _build_idea_generator_prompt(
     node: TreeNode,
     target: str,
@@ -261,10 +310,11 @@ def _build_idea_generator_prompt(
     new_cols = node.new_columns(root_columns)
     new_cols_str = ", ".join(new_cols) if new_cols else "(нет — это корневой узел)"
     critic_dir = node.critic_directive or "(нет директивы)"
+    stats_line = _compute_stats_line(node.df, target, col_map)
     return _IDEA_GENERATOR_PROMPT.format(
         task=task, metric_name=metric_name, metric_direction=metric_direction,
         target=target, goal=goal, description_line=desc_line,
-        columns=cols_str, current_cv=node.cv, root_cv=root_cv,
+        columns=cols_str, stats_line=stats_line, current_cv=node.cv, root_cv=root_cv,
         branch_summary=node.branch_summary(), new_columns=new_cols_str,
         critic_directive=critic_dir, n_ideas=n_ideas,
     )
@@ -340,6 +390,7 @@ class BeamSearchAgent:
         n_trees: int = 1,
         tolerance: float = 1e-4,
         debug: bool = False,
+        sequential: bool = False,
     ):
         self.planner = planner_model
         self.implementer = implementer_model if implementer_model is not None else planner_model
@@ -352,6 +403,7 @@ class BeamSearchAgent:
         self.n_trees = max(1, n_trees)
         self.tolerance = tolerance
         self.debug = debug
+        self.sequential = sequential
 
     def _dbg(self, *parts: Any) -> None:
         if self.debug:
@@ -405,6 +457,16 @@ class BeamSearchAgent:
                 root_cv=root_cv, metric_direction=metric_direction,
             )
             tree_results = [all_nodes]
+        elif self.sequential:
+            # Sequential forest — trees run one after another
+            tree_results = []
+            for tid in range(self.n_trees):
+                self._dbg(f"[forest] starting tree {tid + 1}/{self.n_trees}")
+                nodes = self._run_one_tree(
+                    tree_id=tid, df=df, test_df=test_df,
+                    root_cv=root_cv, metric_direction=metric_direction,
+                )
+                tree_results.append(nodes)
         else:
             # Parallel forest
             tree_results: list[dict[str, TreeNode]] = [{}] * self.n_trees

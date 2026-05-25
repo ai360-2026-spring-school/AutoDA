@@ -12,7 +12,7 @@ from langgraph.graph import StateGraph, START, END
 from .state import AgentState
 from .dataset import DatasetContext
 from .evaluator import CatBoostEvaluator, is_keep, CVResult
-from .preprocessor import run_preprocess
+from .preprocessor import _compute_correlation_stats
 from .column_typer import detect_column_types
 from .actions.registry import TRANSFORMERS
 from .actions.info import sparse_linear_features, baseline_linear_model
@@ -123,41 +123,32 @@ def build_graph(
 
         _dbg(f"[preprocess] {task}, {len(context.df)} rows x {len(context.df.columns)} cols — running...")
 
-        df_out, transformers, col_type_map, corr_stats = run_preprocess(
-            df=context.df,
-            target=target,
-            task=task,
-            ohe_max_cardinality=ohe_max_cardinality,
-            numeric_unique_threshold=numeric_unique_threshold,
-            oversample=oversample,
-        )
+        # Detect column types for prompt context
+        col_type_map = detect_column_types(context.df, target, unique_threshold=numeric_unique_threshold)
 
-        context.current_df = df_out
-        context.fitted_transformers = list(transformers)
+        # Precompute correlation stats for prompt context
+        corr_stats = _compute_correlation_stats(context.df, target, task, col_type_map)
 
-        # Apply preprocessing to test_df (upsampling excluded — no transformer)
+        # CatBoost handles categoricals (via cat_features) and NaN natively —
+        # no OHE, no imputation, no oversampling needed.
+        context.current_df = context.df.copy()
+        context.fitted_transformers = []
+
         if context.test_df is not None:
-            test_out = context.test_df.copy()
-            for t in transformers:
-                try:
-                    test_out = t.apply(test_out)
-                except Exception:
-                    pass
-            context.current_test_df = test_out
+            context.current_test_df = context.test_df.copy()
 
-        # Baseline CV on preprocessed data
+        # Baseline CV on raw data
         X = context.current_df.drop(columns=[target], errors="ignore")
         y = context.current_df[target]
         baseline = evaluator.cv(X, y, step=0)
         baseline_cell[0] = baseline
 
         feature_cols = [c for c in context.current_df.columns if c != target]
-        initial_memory: list[str] = []
 
         _dbg(
             f"[preprocess] {task},"
-            f" {len(context.df)}→{len(df_out)} rows,"
-            f" {len(context.df.columns)}→{len(df_out.columns)} cols,"
+            f" {len(context.df)} rows,"
+            f" {len(context.df.columns)} cols,"
             f" baseline {evaluator.metric_name}={baseline.mean:.4f} ± {baseline.std:.4f}"
         )
 
@@ -178,7 +169,7 @@ def build_graph(
             "decision": "continue",
             "final_report": None,
             "submission_path": None,
-            "planner_memory": initial_memory,
+            "planner_memory": [],
             "critic_message": None,
             "current_iteration_transforms": [],
             "planner_addendum": None,

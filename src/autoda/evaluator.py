@@ -125,16 +125,25 @@ class CatBoostEvaluator:
         history_path: Path | None = None,
     ):
         self.task = task
-        self.metric_name = metric_name
         self.n_splits = n_splits
         self.history_path = history_path
         self.metric_direction: Literal["max", "min"] = _default_metric(task)[1]
-        if metric_name in ("roc_auc", "f1"):
-            self.metric_direction = "max"
-        elif metric_name in ("mlogloss", "rmse", "mae", "mse"):
-            self.metric_direction = "min"
         self.last_feature_importances_: dict[str, float] | None = None
         self._step_counter = 0
+        self._metric_name: str = ""
+        self.metric_name = metric_name  # use setter to also set direction
+
+    @property
+    def metric_name(self) -> str:
+        return self._metric_name
+
+    @metric_name.setter
+    def metric_name(self, value: str) -> None:
+        self._metric_name = value
+        if value in ("roc_auc", "f1", "accuracy"):
+            self.metric_direction = "max"
+        elif value in ("mlogloss", "rmse", "mae", "mse"):
+            self.metric_direction = "min"
 
     @classmethod
     def auto(
@@ -175,7 +184,7 @@ class CatBoostEvaluator:
         if self.task in ("binary", "multiclass"):
             loss = "Logloss" if self.task == "binary" else "MultiClass"
             model_cls = CatBoostClassifier
-            extra = dict(loss_function=loss, eval_metric=cb_metric if self.task == "binary" else "Accuracy")
+            extra = dict(loss_function=loss, eval_metric=cb_metric if self.task == "binary" else "Accuracy", auto_class_weights="Balanced")
         else:
             model_cls = CatBoostRegressor
             extra = dict(loss_function="RMSE", eval_metric=self.metric_name.upper())
@@ -217,6 +226,10 @@ class CatBoostEvaluator:
                     from sklearn.metrics import f1_score
                     preds = model.predict(X_val)
                     score = float(f1_score(y_val, preds, average="weighted"))
+                elif self.metric_name == "accuracy":
+                    from sklearn.metrics import accuracy_score
+                    preds = model.predict(X_val)
+                    score = float(accuracy_score(y_val, preds))
                 else:
                     from sklearn.metrics import log_loss
                     preds = model.predict_proba(X_val)
@@ -262,7 +275,7 @@ class CatBoostEvaluator:
         if self.task in ("binary", "multiclass"):
             loss = "Logloss" if self.task == "binary" else "MultiClass"
             model_cls = CatBoostClassifier
-            extra = dict(loss_function=loss, eval_metric=cb_metric if self.task == "binary" else "Accuracy")
+            extra = dict(loss_function=loss, eval_metric=cb_metric if self.task == "binary" else "Accuracy", auto_class_weights="Balanced")
         else:
             model_cls = CatBoostRegressor
             extra = dict(loss_function="RMSE", eval_metric=self.metric_name.upper())
